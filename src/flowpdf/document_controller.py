@@ -5,21 +5,30 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QObject, QTimer
-from PySide6.QtWidgets import QFileDialog, QInputDialog, QLineEdit, QMessageBox
+from PySide6.QtWidgets import QDialog, QFileDialog, QInputDialog, QLineEdit, QMessageBox
 
 from flowpdf.backends.base import (
+    AnnotationInfo,
+    AnnotationKind,
+    AnnotationSpec,
     InvalidPasswordError,
     PageInfo,
     PasswordRequiredError,
     SearchHit,
+    TextEditability,
+    TextSpan,
+    TextStyle,
 )
 from flowpdf.backends.pymupdf_backend import PyMuPdfBackend
 from flowpdf.editing.document_session import DocumentSession
 from flowpdf.editing.pdf_commands import PdfCommandType
+from flowpdf.editing.tools import ToolMode
 from flowpdf.rendering.render_scheduler import RenderSource
 from flowpdf.services.recent_files import RecentFiles
 from flowpdf.services.recovery_service import RecoveryService
 from flowpdf.services.task_service import TaskContext, TaskHandle, TaskService
+from flowpdf.ui.dialogs.text_edit_dialog import TextEditDialog
+from flowpdf.utils.coordinates import Point, Rect
 
 if TYPE_CHECKING:
     from flowpdf.ui.main_window import MainWindow
@@ -30,6 +39,7 @@ class DocumentSnapshot:
     source: RenderSource
     page_infos: list[PageInfo]
     revision: int
+    annotations: list[AnnotationInfo]
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +145,75 @@ class DocumentController(QObject):
 
         self.tasks.submit(create, on_success=self._apply_loaded, on_error=self._show_task_error)
 
+    def offer_recovery(self) -> None:
+        if self.session is not None or self.tasks.active_count:
+            return
+        sessions = self.recovery_service.list_session_files()
+        if not sessions:
+            return
+        path, record = sessions[0]
+        while True:
+            box = QMessageBox(self.window)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("发现未完成的编辑会话")
+            shown_name = Path(record.source_path).name if record.source_path else "未命名文档"
+            box.setText(f"检测到“{shown_name}”的未保存修改。")
+            box.setInformativeText("恢复操作不会覆盖原文件，保存时仍会创建副本。")
+            restore_button = box.addButton("恢复", QMessageBox.ButtonRole.AcceptRole)
+            discard_button = box.addButton("放弃", QMessageBox.ButtonRole.DestructiveRole)
+            details_button = box.addButton("查看详情", QMessageBox.ButtonRole.ActionRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is restore_button:
+                self.recover_path(path)
+                return
+            if clicked is discard_button:
+                self.recovery_service.discard(path)
+                return
+            if clicked is details_button:
+                QMessageBox.information(
+                    self.window,
+                    "恢复会话详情",
+                    f"源文件：{record.source_path or '未命名文档'}\n"
+                    f"最后更新：{record.updated_at}\n"
+                    f"编辑命令：{len(record.commands)} 条",
+                )
+                continue
+            return
+
+    def recover_path(self, path: str | Path, *, password: str | None = None) -> None:
+        if self.session is not None or self.tasks.active_count:
+            return
+        recovery_path = Path(path)
+
+        def recover(context: TaskContext) -> LoadedSession:
+            session = DocumentSession(
+                PyMuPdfBackend(),
+                recovery_service=self.recovery_service,
+            )
+            session.recover(recovery_path, password=password)
+            return LoadedSession(session, _snapshot(session, context))
+
+        def failed(error: Exception) -> None:
+            if isinstance(error, (PasswordRequiredError, InvalidPasswordError)):
+                entered, accepted = QInputDialog.getText(
+                    self.window,
+                    "恢复加密 PDF",
+                    "恢复日志不保存密码，请重新输入 PDF 密码：",
+                    QLineEdit.EchoMode.Password,
+                )
+                if accepted:
+                    self.recover_path(recovery_path, password=entered)
+                return
+            self.window.show_error("无法恢复编辑会话", str(error))
+
+        def completed(loaded: LoadedSession) -> None:
+            self._apply_loaded(loaded)
+            self.window.set_saved_status("已恢复未保存修改；原文件仍未被改动")
+
+        self.tasks.submit(recover, on_success=completed, on_error=failed, priority=25)
+
     def search(self, query: str) -> None:
         needle = query.strip()
         if not needle or self.session is None:
@@ -212,6 +291,59 @@ class DocumentController(QObject):
             priority=30,
         )
 
+    def add_text(self, page_index: int, rect: Rect, text: str, style: TextStyle) -> None:
+        self._mutate(
+            PdfCommandType.ADD_TEXT,
+            page_index=page_index,
+            rect=rect,
+            text=text,
+            style=style,
+        )
+
+    def replace_text(
+        self,
+        page_index: int,
+        rect: Rect,
+        text: str,
+        style: TextStyle,
+    ) -> None:
+        self._mutate(
+            PdfCommandType.REPLACE_TEXT,
+            page_index=page_index,
+            rect=rect,
+            text=text,
+            style=style,
+        )
+
+    def add_image(self, page_index: int, rect: Rect, image_path: str | Path) -> None:
+        self._mutate(
+            PdfCommandType.ADD_IMAGE,
+            page_index=page_index,
+            rect=rect,
+            image_path=str(image_path),
+        )
+
+    def add_annotation(self, page_index: int, annotation: AnnotationSpec) -> None:
+        self._mutate(
+            PdfCommandType.ADD_ANNOTATION,
+            page_index=page_index,
+            annotation=annotation,
+        )
+
+    def delete_annotation(self, page_index: int, xref: int) -> None:
+        self._mutate(
+            PdfCommandType.DELETE_ANNOTATION,
+            page_index=page_index,
+            xref=xref,
+        )
+
+    def permanent_delete(self, page_index: int, rect: Rect) -> None:
+        self._mutate(
+            PdfCommandType.DELETE_CONTENT,
+            page_index=page_index,
+            rect=rect,
+        )
+
     def undo(self) -> None:
         self._history_operation(redo=False)
 
@@ -261,6 +393,9 @@ class DocumentController(QObject):
         if path:
             self.insert_pdf(path, insert_index)
 
+    def merge_pdf_dialog(self) -> None:
+        self.insert_pdf_dialog(self.session.page_count if self.session is not None else None)
+
     def insert_pdf(self, path: str | Path, insert_index: int | None = None) -> None:
         if self.session is None:
             return
@@ -296,6 +431,43 @@ class DocumentController(QObject):
         self.tasks.submit(
             perform,
             on_success=lambda output: self.window.set_saved_status(f"已导出：{output.name}"),
+            on_error=self._show_task_error,
+        )
+
+    def split_pdf_dialog(self) -> None:
+        directory = QFileDialog.getExistingDirectory(self.window, "选择拆分文件保存目录")
+        if directory:
+            self.split_to_directory(directory)
+
+    def split_to_directory(self, directory: str | Path) -> None:
+        if self.session is None or self.tasks.active_count:
+            return
+        destination = Path(directory)
+        if not destination.is_dir():
+            self.window.show_error("无法拆分 PDF", "所选保存目录不存在")
+            return
+        session = self.session
+        source = session.saved_path or session.source_path
+        stem = source.stem if source is not None else "未命名"
+
+        def perform(context: TaskContext) -> list[Path]:
+            outputs: list[Path] = []
+            for index in range(session.page_count):
+                context.raise_if_cancelled()
+                output = _unique_page_path(destination, stem, index + 1)
+                session.backend.export_pages([index], output)
+                outputs.append(output)
+                context.report_progress(
+                    round((index + 1) * 100 / session.page_count),
+                    f"正在导出第 {index + 1} 页",
+                )
+            return outputs
+
+        self.tasks.submit(
+            perform,
+            on_success=lambda outputs: self.window.set_saved_status(
+                f"已拆分为 {len(outputs)} 个 PDF"
+            ),
             on_error=self._show_task_error,
         )
 
@@ -351,6 +523,7 @@ class DocumentController(QObject):
             loaded.snapshot.page_infos,
             title=title,
             revision=loaded.snapshot.revision,
+            annotations=loaded.snapshot.annotations,
         )
         if path is not None:
             self.recent_files.add(path)
@@ -408,6 +581,7 @@ class DocumentController(QObject):
             snapshot.source,
             snapshot.page_infos,
             revision=snapshot.revision,
+            annotations=snapshot.annotations,
         )
         self.window.set_saved_status("有未保存修改；原文件未被改动")
         self._update_history_actions()
@@ -466,7 +640,7 @@ class DocumentController(QObject):
     def _close_session(self) -> None:
         self._autosave.stop()
         if self.session is not None:
-            self.session.close()
+            self.session.close(discard_recovery=True)
             self.session = None
         self._search_hits.clear()
         self._search_index = None
@@ -481,6 +655,128 @@ class DocumentController(QObject):
 
     def _show_task_error(self, error: Exception) -> None:
         self.window.show_error("操作失败", str(error))
+
+    def _handle_region(self, tool_value: str, page_index: int, rect: Rect) -> None:
+        tool = ToolMode(tool_value)
+        if tool is ToolMode.ADD_TEXT:
+            dialog = TextEditDialog(parent=self.window)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                text, style = dialog.text_and_style()
+                if text:
+                    self.add_text(page_index, rect, text, style)
+            return
+        if tool is ToolMode.ADD_IMAGE:
+            path, _filter = QFileDialog.getOpenFileName(
+                self.window,
+                "插入图片",
+                "",
+                "图片 (*.png *.jpg *.jpeg *.webp)",
+            )
+            if path:
+                self.add_image(page_index, rect, path)
+            return
+        if tool is ToolMode.PERMANENT_DELETE:
+            answer = QMessageBox.warning(
+                self.window,
+                "永久擦除",
+                "这会真正删除框选区域内的文字、图片和矢量内容。保存后不能通过搜索或复制找回。继续吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer is QMessageBox.StandardButton.Yes:
+                self.permanent_delete(page_index, rect)
+            return
+
+        kinds = {
+            ToolMode.HIGHLIGHT: AnnotationKind.HIGHLIGHT,
+            ToolMode.UNDERLINE: AnnotationKind.UNDERLINE,
+            ToolMode.STRIKEOUT: AnnotationKind.STRIKEOUT,
+            ToolMode.NOTE: AnnotationKind.NOTE,
+            ToolMode.LINE: AnnotationKind.LINE,
+            ToolMode.ARROW: AnnotationKind.ARROW,
+            ToolMode.RECTANGLE: AnnotationKind.RECTANGLE,
+            ToolMode.ELLIPSE: AnnotationKind.ELLIPSE,
+        }
+        kind = kinds.get(tool)
+        if kind is None:
+            return
+        content = ""
+        if kind is AnnotationKind.NOTE:
+            content, accepted = QInputDialog.getMultiLineText(
+                self.window,
+                "添加便签",
+                "便签内容：",
+            )
+            if not accepted:
+                return
+        points = ()
+        if kind in {AnnotationKind.LINE, AnnotationKind.ARROW}:
+            points = (Point(rect.x0, rect.y0), Point(rect.x1, rect.y1))
+        color = (1.0, 0.82, 0.0)
+        if kind not in {AnnotationKind.HIGHLIGHT, AnnotationKind.UNDERLINE}:
+            color = (0.15, 0.39, 0.92)
+        self.add_annotation(
+            page_index,
+            AnnotationSpec(
+                kind=kind,
+                rect=rect,
+                color=color,
+                opacity=0.45 if kind is AnnotationKind.HIGHLIGHT else 0.9,
+                content=content,
+                points=points,
+            ),
+        )
+
+    def _edit_text_at(self, page_index: int, point: Point) -> None:
+        if self.session is None or self.tasks.active_count:
+            return
+        session = self.session
+
+        def locate(context: TaskContext) -> tuple[TextSpan | None, bool]:
+            spans = session.backend.extract_text_spans(page_index)
+            candidates = [span for span in spans if _contains(span.rect, point)]
+            if candidates:
+                return min(candidates, key=lambda span: span.rect.width * span.rect.height), False
+            scanned_check = getattr(session.backend, "is_probably_scanned", None)
+            scanned = bool(scanned_check and scanned_check(page_index))
+            return None, scanned
+
+        def selected(result: tuple[TextSpan | None, bool]) -> None:
+            span, scanned = result
+            if span is None:
+                if scanned:
+                    QMessageBox.information(
+                        self.window,
+                        "此页可能是扫描内容",
+                        "未检测到可编辑文字层。可使用“识别此区域”或“识别当前页”；"
+                        "当前版本尚未安装可选 OCR 组件。",
+                    )
+                else:
+                    self.window.set_saved_status("双击位置没有可编辑文字块")
+                return
+            if span.editability is TextEditability.UNSUPPORTED:
+                QMessageBox.information(
+                    self.window,
+                    "暂时无法编辑",
+                    "此文字块使用了当前版本无法可靠处理的版式。",
+                )
+                return
+            warning = ""
+            if span.editability is TextEditability.FONT_SUBSTITUTION:
+                warning = "原字体在本机不可用（黄色状态），保存时会使用相近字体替换。"
+            dialog = TextEditDialog(
+                text=span.text,
+                style=_style_from_span(span),
+                title="修改已有文字",
+                warning=warning,
+                parent=self.window,
+            )
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                text, style = dialog.text_and_style()
+                if text:
+                    self.replace_text(page_index, span.rect, text, style)
+
+        self.tasks.submit(locate, on_success=selected, on_error=self._show_task_error)
 
     def _on_busy_changed(self, busy: bool) -> None:
         self.window.set_busy(busy)
@@ -521,6 +817,8 @@ class DocumentController(QObject):
         window.export_pages_action.triggered.connect(
             lambda _checked=False: self.export_selected_pages()
         )
+        window.merge_pdf_action.triggered.connect(lambda _checked=False: self.merge_pdf_dialog())
+        window.split_pdf_action.triggered.connect(lambda _checked=False: self.split_pdf_dialog())
         window.thumbnail_panel.page_move_requested.connect(self.move_page)
         window.thumbnail_panel.insert_pdf_requested.connect(self.insert_pdf)
         window.thumbnail_panel.delete_requested.connect(
@@ -530,14 +828,22 @@ class DocumentController(QObject):
         window.thumbnail_panel.rotate_requested.connect(self.rotate_selected_pages)
         window.thumbnail_panel.export_requested.connect(self.export_selected_pages)
         window.thumbnail_panel.insert_blank_requested.connect(self.insert_blank_page)
+        window.document_view.region_selected.connect(self._handle_region)
+        window.document_view.point_double_clicked.connect(self._edit_text_at)
+        window.annotation_panel.annotation_activated.connect(
+            lambda page, _xref: window.document_view.jump_to_page(page)
+        )
+        window.annotation_panel.delete_requested.connect(self.delete_annotation)
 
 
 def _snapshot(session: DocumentSession, context: TaskContext) -> DocumentSnapshot:
     page_count = session.page_count
     infos: list[PageInfo] = []
+    annotations: list[AnnotationInfo] = []
     for index in range(page_count):
         context.raise_if_cancelled()
         infos.append(session.backend.page_size(index))
+        annotations.extend(session.backend.list_annotations(index))
         if page_count > 10 and index % 10 == 0:
             context.report_progress(35 + round(35 * index / page_count), "正在读取页面尺寸")
     context.report_progress(75, "正在建立安全工作快照")
@@ -546,4 +852,32 @@ def _snapshot(session: DocumentSession, context: TaskContext) -> DocumentSnapsho
         RenderSource(session.document_id, data),
         infos,
         session.revision,
+        annotations,
     )
+
+
+def _contains(rect: Rect, point: Point) -> bool:
+    normalized = rect.normalized()
+    return normalized.x0 <= point.x <= normalized.x1 and normalized.y0 <= point.y <= normalized.y1
+
+
+def _style_from_span(span: TextSpan) -> TextStyle:
+    color = span.color
+    return TextStyle(
+        font_family=span.font_family,
+        font_size=span.font_size,
+        color=(
+            ((color >> 16) & 0xFF) / 255,
+            ((color >> 8) & 0xFF) / 255,
+            (color & 0xFF) / 255,
+        ),
+    )
+
+
+def _unique_page_path(directory: Path, stem: str, page_number: int) -> Path:
+    candidate = directory / f"{stem}_第{page_number}页.pdf"
+    sequence = 2
+    while candidate.exists():
+        candidate = directory / f"{stem}_第{page_number}页 ({sequence}).pdf"
+        sequence += 1
+    return candidate

@@ -119,6 +119,16 @@ class ImageInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class AnnotationInfo:
+    page_index: int
+    xref: int
+    kind: AnnotationKind
+    rect: Rect
+    content: str = ""
+    author: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class TextStyle:
     font_family: str = "Microsoft YaHei"
     font_size: float = 11.0
@@ -222,6 +232,14 @@ class PdfBackend(ABC):
 
     @abstractmethod
     def add_annotation(self, page_index: int, annotation: AnnotationSpec) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_annotations(self, page_index: int) -> list[AnnotationInfo]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def delete_annotation(self, page_index: int, xref: int) -> None:
         raise NotImplementedError
 
     @abstractmethod

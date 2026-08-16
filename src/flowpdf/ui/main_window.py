@@ -6,6 +6,7 @@ from typing import Any
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import (
     QAction,
+    QActionGroup,
     QCloseEvent,
     QDragEnterEvent,
     QDropEvent,
@@ -26,9 +27,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from flowpdf.backends.base import PageInfo
+from flowpdf.backends.base import AnnotationInfo, PageInfo
+from flowpdf.editing.tools import ToolMode
 from flowpdf.i18n import tr
 from flowpdf.rendering.render_scheduler import RenderScheduler, RenderSource
+from flowpdf.ui.annotation_panel import AnnotationPanel
 from flowpdf.ui.document_view import DocumentView
 from flowpdf.ui.search_panel import SearchPanel
 from flowpdf.ui.thumbnail_panel import ThumbnailPanel
@@ -40,6 +43,7 @@ class MainWindow(QMainWindow):
 
     pdf_dropped = Signal(str)
     recent_file_requested = Signal(str)
+    theme_requested = Signal(str)
 
     def __init__(self, scheduler: RenderScheduler) -> None:
         super().__init__()
@@ -80,10 +84,12 @@ class MainWindow(QMainWindow):
         *,
         title: str,
         revision: int = 0,
+        annotations: list[AnnotationInfo] | None = None,
     ) -> None:
         self._page_count = len(page_infos)
         self.document_view.set_document(source, page_infos, revision=revision)
         self.thumbnail_panel.set_document(source, page_infos, revision=revision)
+        self.annotation_panel.set_annotations(annotations or [])
         self.page_spin.setRange(1, max(1, self._page_count))
         self.page_spin.setValue(1)
         self._workspace.setCurrentWidget(self.document_view)
@@ -97,16 +103,19 @@ class MainWindow(QMainWindow):
         page_infos: list[PageInfo],
         *,
         revision: int,
+        annotations: list[AnnotationInfo] | None = None,
     ) -> None:
         self._page_count = len(page_infos)
         self.document_view.update_snapshot(source, page_infos, revision=revision)
         self.thumbnail_panel.set_document(source, page_infos, revision=revision)
+        self.annotation_panel.set_annotations(annotations or [])
         self.page_spin.setRange(1, max(1, self._page_count))
         self._update_page_status(self.document_view.current_page)
 
     def clear_document(self) -> None:
         self.document_view.clear_document()
         self.thumbnail_panel.clear_document()
+        self.annotation_panel.clear()
         self.search_panel.set_results(0, 0)
         self._page_count = 0
         self._workspace.setCurrentWidget(self._welcome)
@@ -137,9 +146,14 @@ class MainWindow(QMainWindow):
             self.insert_blank_action,
             self.insert_pdf_action,
             self.export_pages_action,
+            self.merge_pdf_action,
+            self.split_pdf_action,
+            *self.tool_actions.values(),
         ):
             action.setEnabled(enabled)
         self.page_spin.setEnabled(enabled)
+        if not enabled:
+            self.document_view.set_tool(ToolMode.SELECT)
 
     def set_busy(self, busy: bool, message: str = "") -> None:
         self.progress_bar.setVisible(busy)
@@ -261,6 +275,17 @@ class MainWindow(QMainWindow):
         self.continuous_action = QAction(tr("MainWindow", "连续滚动"), self)
         self.continuous_action.setCheckable(True)
         self.continuous_action.setChecked(True)
+        self.cache_settings_action = QAction("渲染缓存设置…", self)
+
+        self.light_theme_action = QAction("浅色主题", self)
+        self.dark_theme_action = QAction("深色主题", self)
+        self.light_theme_action.setCheckable(True)
+        self.dark_theme_action.setCheckable(True)
+        self.theme_group = QActionGroup(self)
+        self.theme_group.setExclusive(True)
+        self.theme_group.addAction(self.light_theme_action)
+        self.theme_group.addAction(self.dark_theme_action)
+        self.light_theme_action.setChecked(True)
 
         self.delete_pages_action = QAction("删除所选页面", self)
         self.delete_pages_action.setShortcut(QKeySequence(Qt.Key.Key_Delete))
@@ -269,6 +294,34 @@ class MainWindow(QMainWindow):
         self.insert_blank_action = QAction("插入空白页面", self)
         self.insert_pdf_action = QAction("从 PDF 插入页面", self)
         self.export_pages_action = QAction("导出所选页面", self)
+        self.merge_pdf_action = QAction("合并 PDF…", self)
+        self.split_pdf_action = QAction("拆分为单页 PDF…", self)
+
+        self.tool_group = QActionGroup(self)
+        self.tool_group.setExclusive(True)
+        tool_labels = {
+            ToolMode.SELECT: "选择/平移",
+            ToolMode.ADD_TEXT: "添加文字",
+            ToolMode.ADD_IMAGE: "添加图片",
+            ToolMode.HIGHLIGHT: "高亮",
+            ToolMode.UNDERLINE: "下划线批注",
+            ToolMode.STRIKEOUT: "删除线",
+            ToolMode.NOTE: "便签",
+            ToolMode.LINE: "直线",
+            ToolMode.ARROW: "箭头",
+            ToolMode.RECTANGLE: "矩形",
+            ToolMode.ELLIPSE: "椭圆",
+            ToolMode.PERMANENT_DELETE: "永久擦除",
+        }
+        self.tool_actions: dict[ToolMode, QAction] = {}
+        for tool, label in tool_labels.items():
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setData(tool.value)
+            self.tool_group.addAction(action)
+            self.tool_actions[tool] = action
+        self.tool_actions[ToolMode.SELECT].setChecked(True)
+        self.tool_actions[ToolMode.SELECT].setShortcut(QKeySequence(Qt.Key.Key_Escape))
 
     def _create_menus(self) -> None:
         file_menu = self.menuBar().addMenu(tr("MainWindow", "文件"))
@@ -289,11 +342,33 @@ class MainWindow(QMainWindow):
                 self.duplicate_pages_action,
                 self.rotate_pages_action,
                 self.export_pages_action,
+                self.merge_pdf_action,
+                self.split_pdf_action,
                 self.delete_pages_action,
             ]
         )
         self.annotation_menu = self.menuBar().addMenu(tr("MainWindow", "批注"))
+        self.annotation_menu.addActions(
+            [
+                self.tool_actions[ToolMode.HIGHLIGHT],
+                self.tool_actions[ToolMode.UNDERLINE],
+                self.tool_actions[ToolMode.STRIKEOUT],
+                self.tool_actions[ToolMode.NOTE],
+                self.tool_actions[ToolMode.LINE],
+                self.tool_actions[ToolMode.ARROW],
+                self.tool_actions[ToolMode.RECTANGLE],
+                self.tool_actions[ToolMode.ELLIPSE],
+            ]
+        )
         self.signature_menu = self.menuBar().addMenu(tr("MainWindow", "填写与签名"))
+        self.signature_menu.addActions(
+            [
+                self.tool_actions[ToolMode.ADD_TEXT],
+                self.tool_actions[ToolMode.ADD_IMAGE],
+            ]
+        )
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.tool_actions[ToolMode.PERMANENT_DELETE])
         self.view_menu = self.menuBar().addMenu(tr("MainWindow", "视图"))
         self.view_menu.addActions(
             [
@@ -305,6 +380,9 @@ class MainWindow(QMainWindow):
                 self.continuous_action,
             ]
         )
+        theme_menu = self.view_menu.addMenu("主题")
+        theme_menu.addActions([self.light_theme_action, self.dark_theme_action])
+        self.view_menu.addAction(self.cache_settings_action)
 
     def _create_toolbar(self) -> None:
         toolbar = QToolBar(tr("MainWindow", "常用工具"), self)
@@ -316,6 +394,16 @@ class MainWindow(QMainWindow):
         toolbar.addActions([self.undo_action, self.redo_action])
         toolbar.addSeparator()
         toolbar.addActions([self.search_action, self.zoom_out_action, self.zoom_in_action])
+        toolbar.addSeparator()
+        toolbar.addActions(
+            [
+                self.tool_actions[ToolMode.SELECT],
+                self.tool_actions[ToolMode.ADD_TEXT],
+                self.tool_actions[ToolMode.ADD_IMAGE],
+                self.tool_actions[ToolMode.HIGHLIGHT],
+                self.tool_actions[ToolMode.PERMANENT_DELETE],
+            ]
+        )
         toolbar.addSeparator()
         toolbar.addWidget(QLabel("页码", toolbar))
         self.page_spin = QSpinBox(toolbar)
@@ -345,7 +433,8 @@ class MainWindow(QMainWindow):
         self.thumbnail_panel = ThumbnailPanel(self.scheduler, tabs)
         tabs.addTab(self.thumbnail_panel, tr("MainWindow", "页面"))
         tabs.addTab(QListWidget(tabs), tr("MainWindow", "书签"))
-        tabs.addTab(QListWidget(tabs), tr("MainWindow", "批注"))
+        self.annotation_panel = AnnotationPanel(tabs)
+        tabs.addTab(self.annotation_panel, tr("MainWindow", "批注"))
         dock.setWidget(tabs)
         dock.setMinimumWidth(190)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
@@ -396,6 +485,17 @@ class MainWindow(QMainWindow):
         self.page_spin.valueChanged.connect(lambda page: self.document_view.jump_to_page(page - 1))
         self.search_action.triggered.connect(self.show_search)
         self.search_panel.close_requested.connect(self.hide_search)
+        for tool, action in self.tool_actions.items():
+            action.triggered.connect(
+                lambda _checked=False, selected=tool: self.document_view.set_tool(selected)
+            )
+        self.document_view.tool_changed.connect(self._sync_tool_action)
+        self.light_theme_action.triggered.connect(
+            lambda _checked=False: self.theme_requested.emit("light")
+        )
+        self.dark_theme_action.triggered.connect(
+            lambda _checked=False: self.theme_requested.emit("dark")
+        )
 
     def _update_page_status(self, page_index: int) -> None:
         if not self._page_count:
@@ -406,6 +506,15 @@ class MainWindow(QMainWindow):
         blocked = self.page_spin.blockSignals(True)
         self.page_spin.setValue(page_index + 1)
         self.page_spin.blockSignals(blocked)
+
+    def _sync_tool_action(self, value: str) -> None:
+        tool = ToolMode(value)
+        self.tool_actions[tool].setChecked(True)
+        if tool is not ToolMode.SELECT:
+            self.save_status.setText(f"当前工具：{self.tool_actions[tool].text()}；Esc 取消")
+
+    def set_theme_choice(self, value: str) -> None:
+        (self.dark_theme_action if value == "dark" else self.light_theme_action).setChecked(True)
 
 
 def _first_pdf_path(mime_data) -> Path | None:

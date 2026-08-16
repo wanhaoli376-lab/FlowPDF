@@ -1,0 +1,30 @@
+{
+  "recorded_at": "2026-08-16",
+  "environment": {
+    "python": "3.14.5",
+    "platform": "win32",
+    "cpu_count": 24
+  },
+  "fixture": {
+    "pages": 300,
+    "source_bytes": 50551,
+    "kind": "synthetic-lightweight"
+  },
+  "seconds": {
+    "open_document": 0.01123,
+    "first_page_render": 0.00326,
+    "all_thumbnails": 0.025017,
+    "extract_all_text": 0.016976,
+    "save_document": 0.005623
+  },
+  "render": {
+    "first_page_bytes": 1502970,
+    "thumbnail_cache_bytes": 6609600,
+    "thumbnail_cache_limit_bytes": 536870912,
+    "maximum_simulated_queue": 300,
+    "queue_after_page_jump_cancellation": 1
+  },
+  "text_span_count": 300,
+  "process_peak_working_set_bytes": 97320960,
+  "note": "Current-machine regression baseline only; not an absolute performance claim."
+}

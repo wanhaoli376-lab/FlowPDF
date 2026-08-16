@@ -1,0 +1,13 @@
+# Reproducible Windows 0.1.0a1 build environment (Python 3.14.5 x64).
+altgraph==0.17.5
+packaging==26.2
+pefile==2024.8.26
+Pillow==12.2.0
+PyInstaller==6.22.1
+pyinstaller-hooks-contrib==2026.6
+PyMuPDF==1.28.2
+PySide6==6.11.1
+PySide6_Addons==6.11.1
+PySide6_Essentials==6.11.1
+pywin32-ctypes==0.2.3
+shiboken6==6.11.1

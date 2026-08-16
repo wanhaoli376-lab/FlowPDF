@@ -3,7 +3,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from flowpdf.backends.base import PdfBackend, PdfError
+from flowpdf.backends.base import (
+    InvalidPasswordError,
+    PasswordRequiredError,
+    PdfBackend,
+    PdfError,
+)
 from flowpdf.editing.command_stack import CommandStack
 from flowpdf.editing.pdf_commands import PdfCommandType, PdfMutationCommand
 from flowpdf.services.recovery_service import RecoveryService
@@ -127,6 +132,8 @@ class DocumentSession:
             for command_record in record.commands:
                 command = PdfMutationCommand.from_record(self.backend, command_record)
                 self.command_stack.push(command)
+        except (PasswordRequiredError, InvalidPasswordError):
+            raise
         except (PdfError, OSError, ValueError, KeyError) as exc:
             if self.is_open and initial is not None:
                 self.backend.load_bytes(initial)
@@ -170,7 +177,9 @@ class DocumentSession:
         self._notify()
         return result
 
-    def close(self) -> None:
+    def close(self, *, discard_recovery: bool = False) -> None:
+        if discard_recovery and self._recovery_path is not None:
+            self.recovery_service.discard(self._recovery_path)
         self.backend.close_document()
         self.source_path = None
         self.saved_path = None

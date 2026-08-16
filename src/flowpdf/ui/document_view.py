@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import math
 
-from PySide6.QtCore import QEvent, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QCloseEvent,
+    QColor,
     QKeyEvent,
+    QMouseEvent,
     QPainter,
+    QPen,
     QResizeEvent,
     QTransform,
     QWheelEvent,
 )
-from PySide6.QtWidgets import QGraphicsView
+from PySide6.QtWidgets import QGraphicsRectItem, QGraphicsView
 
 from flowpdf.backends.base import PageInfo, SearchHit
+from flowpdf.editing.tools import ToolMode
 from flowpdf.rendering.render_scheduler import RenderPriority, RenderScheduler, RenderSource
 from flowpdf.rendering.tile_cache import TileKey
 from flowpdf.ui.page_scene import PageScene
@@ -25,6 +29,9 @@ class DocumentView(QGraphicsView):
     current_page_changed = Signal(int)
     zoom_changed = Signal(float)
     escape_pressed = Signal()
+    tool_changed = Signal(str)
+    region_selected = Signal(str, int, object)
+    point_double_clicked = Signal(int, object)
 
     def __init__(self, scheduler: RenderScheduler, parent=None) -> None:
         super().__init__(parent)
@@ -41,6 +48,10 @@ class DocumentView(QGraphicsView):
         self._continuous = True
         self._last_error = ""
         self._owner = f"document-view-{id(self)}"
+        self._tool = ToolMode.SELECT
+        self._selection_start = None
+        self._selection_page = None
+        self._selection_item: QGraphicsRectItem | None = None
 
         self.setRenderHints(
             self.renderHints()
@@ -110,6 +121,7 @@ class DocumentView(QGraphicsView):
         self._queue_schedule()
 
     def clear_document(self) -> None:
+        self._cancel_region_selection()
         self.scheduler.cancel_owner_obsolete(self._owner, set())
         self._source = None
         self._page_infos.clear()
@@ -121,6 +133,25 @@ class DocumentView(QGraphicsView):
         self._continuous = continuous
         self.page_scene.set_single_page(None if continuous else self._current_page)
         self._queue_schedule()
+
+    @property
+    def tool(self) -> ToolMode:
+        return self._tool
+
+    def set_tool(self, tool: ToolMode | str) -> None:
+        selected = tool if isinstance(tool, ToolMode) else ToolMode(tool)
+        if selected is self._tool:
+            return
+        self._cancel_region_selection()
+        self._tool = selected
+        editing = selected is not ToolMode.SELECT
+        self.setDragMode(
+            QGraphicsView.DragMode.NoDrag if editing else QGraphicsView.DragMode.ScrollHandDrag
+        )
+        self.viewport().setCursor(
+            Qt.CursorShape.CrossCursor if editing else Qt.CursorShape.ArrowCursor
+        )
+        self.tool_changed.emit(selected.value)
 
     def set_zoom(self, zoom: float) -> None:
         self._apply_zoom(zoom, under_mouse=False)
@@ -199,6 +230,7 @@ class DocumentView(QGraphicsView):
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() == Qt.Key.Key_Escape:
+            self.set_tool(ToolMode.SELECT)
             self.escape_pressed.emit()
             event.accept()
             return
@@ -208,7 +240,69 @@ class DocumentView(QGraphicsView):
         super().resizeEvent(event)
         self._queue_schedule()
 
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if self._tool is ToolMode.SELECT or event.button() is not Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        scene_position = self.mapToScene(event.position().toPoint())
+        page = self._page_at_scene(scene_position.x(), scene_position.y())
+        if page is None:
+            super().mousePressEvent(event)
+            return
+        self._selection_start = scene_position
+        self._selection_page = page
+        self._selection_item = QGraphicsRectItem()
+        self._selection_item.setPen(QPen(QColor("#7C3AED"), 1.5, Qt.PenStyle.DashLine))
+        self._selection_item.setBrush(QColor(124, 58, 237, 35))
+        self._selection_item.setZValue(100)
+        self.page_scene.addItem(self._selection_item)
+        event.accept()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._selection_item is None or self._selection_start is None:
+            super().mouseMoveEvent(event)
+            return
+        current = self.mapToScene(event.position().toPoint())
+        self._update_region_selection(current.x(), current.y())
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if (
+            self._selection_item is None
+            or self._selection_start is None
+            or self._selection_page is None
+            or event.button() is not Qt.MouseButton.LeftButton
+        ):
+            super().mouseReleaseEvent(event)
+            return
+        current = self.mapToScene(event.position().toPoint())
+        selected = self._selection_scene_rect(current.x(), current.y())
+        if selected.width() < 3 or selected.height() < 3:
+            width, height = _default_tool_size(self._tool)
+            selected.setWidth(width)
+            selected.setHeight(height)
+            selected = selected.intersected(self._selection_page.sceneBoundingRect())
+        page_index = self._selection_page.page_index
+        pdf_rect = self._selection_page.scene_rect_to_pdf(selected).normalized()
+        self._cancel_region_selection()
+        self.region_selected.emit(self._tool.value, page_index, pdf_rect)
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if self._tool is not ToolMode.SELECT:
+            super().mouseDoubleClickEvent(event)
+            return
+        scene_position = self.mapToScene(event.position().toPoint())
+        page = self._page_at_scene(scene_position.x(), scene_position.y())
+        if page is None:
+            super().mouseDoubleClickEvent(event)
+            return
+        point = page.scene_point_to_pdf(scene_position.x(), scene_position.y())
+        self.point_double_clicked.emit(page.page_index, point)
+        event.accept()
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._cancel_region_selection()
         self._schedule_timer.stop()
         self.clear_document()
         super().closeEvent(event)
@@ -364,3 +458,34 @@ class DocumentView(QGraphicsView):
         screen = self.screen()
         dpi = screen.logicalDotsPerInchX() if screen is not None else 96.0
         return max(0.5, dpi / 72.0)
+
+    def _page_at_scene(self, x: float, y: float):
+        index = self.page_scene.page_at(x, y)
+        return None if index is None else self.page_scene.pages[index]
+
+    def _selection_scene_rect(self, x: float, y: float) -> QRectF:
+        assert self._selection_start is not None
+        assert self._selection_page is not None
+        raw = QRectF(self._selection_start, QPointF(x, y))
+        return raw.normalized().intersected(self._selection_page.sceneBoundingRect())
+
+    def _update_region_selection(self, x: float, y: float) -> None:
+        assert self._selection_item is not None
+        self._selection_item.setRect(self._selection_scene_rect(x, y))
+
+    def _cancel_region_selection(self) -> None:
+        if self._selection_item is not None and self._selection_item.scene() is not None:
+            self.page_scene.removeItem(self._selection_item)
+        self._selection_item = None
+        self._selection_start = None
+        self._selection_page = None
+
+
+def _default_tool_size(tool: ToolMode) -> tuple[float, float]:
+    if tool is ToolMode.NOTE:
+        return 28.0, 28.0
+    if tool is ToolMode.ADD_IMAGE:
+        return 180.0, 120.0
+    if tool is ToolMode.ADD_TEXT:
+        return 200.0, 60.0
+    return 120.0, 50.0

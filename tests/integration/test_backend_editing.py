@@ -57,6 +57,38 @@ def test_replace_text_permanently_removes_old_searchable_content(pdfs, tmp_path)
     assert "2025" not in "".join(span.text for span in reopened.extract_text_spans(0))
 
 
+def test_permanent_delete_removes_text_image_and_vector_content(tmp_path) -> None:
+    source = tmp_path / "redaction-source.pdf"
+    image_path = tmp_path / "redaction-image.png"
+    Image.new("RGB", (80, 60), "#EF4444").save(image_path)
+    document = pymupdf.open()
+    page = document.new_page(width=595, height=842)
+    page.insert_text((72, 90), "Permanently remove me")
+    page.draw_rect(pymupdf.Rect(60, 120, 250, 220), color=(0, 0, 1), width=4)
+    page.insert_image(pymupdf.Rect(300, 120, 460, 240), filename=str(image_path))
+    document.ez_save(source)
+    document.close()
+    output = tmp_path / "permanently-deleted.pdf"
+    backend = PyMuPdfBackend()
+    backend.open_document(source)
+
+    backend.delete_content(0, Rect(0, 0, 595, 842))
+    backend.save_document(output)
+    backend.close_document()
+
+    reopened = PyMuPdfBackend()
+    reopened.open_document(output)
+    assert reopened.search_text("Permanently remove me") == []
+    assert reopened.list_images(0) == []
+    reopened.close_document()
+    verification = pymupdf.open(output)
+    drawings = verification[0].get_drawings()
+    assert len(drawings) == 1
+    assert drawings[0]["fill"] == (1.0, 1.0, 1.0)
+    assert drawings[0]["rect"] == pymupdf.Rect(0, 0, 595, 842)
+    verification.close()
+
+
 def test_insert_image_and_annotation_survive_save(pdfs, tmp_path) -> None:
     image_path = tmp_path / "插入图片.webp"
     Image.new("RGBA", (120, 80), (220, 30, 70, 180)).save(image_path)

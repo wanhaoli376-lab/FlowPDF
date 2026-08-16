@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import os
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths
 
 
 def _log_directory() -> Path:
-    base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppLocalDataLocation)
+    configured = os.environ.get("FLOWPDF_DATA_DIR")
+    base = configured or QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.AppLocalDataLocation
+    )
     path = Path(base or ".") / "logs"
     path.mkdir(parents=True, exist_ok=True)
     return path

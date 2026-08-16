@@ -11,6 +11,7 @@ import pymupdf
 from PIL import Image, UnidentifiedImageError
 
 from flowpdf.backends.base import (
+    AnnotationInfo,
     AnnotationKind,
     AnnotationSpec,
     DocumentValidation,
@@ -42,6 +43,18 @@ _BASE14_FONTS = {
     "symbol",
     "times-roman",
     "zapfdingbats",
+}
+
+_ANNOTATION_TYPE_MAP = {
+    "highlight": AnnotationKind.HIGHLIGHT,
+    "underline": AnnotationKind.UNDERLINE,
+    "strikeout": AnnotationKind.STRIKEOUT,
+    "text": AnnotationKind.NOTE,
+    "freetext": AnnotationKind.FREE_TEXT,
+    "ink": AnnotationKind.INK,
+    "line": AnnotationKind.LINE,
+    "square": AnnotationKind.RECTANGLE,
+    "circle": AnnotationKind.ELLIPSE,
 }
 
 
@@ -414,6 +427,41 @@ class PyMuPdfBackend(PdfBackend):
             annot.set_info(content=annotation.content, title=annotation.author)
             annot.update()
             self._revision += 1
+
+    @serialized_pymupdf
+    def list_annotations(self, page_index: int) -> list[AnnotationInfo]:
+        with self._lock:
+            page = self._page(page_index)
+            annotations: list[AnnotationInfo] = []
+            for annotation in page.annots() or ():
+                kind = _ANNOTATION_TYPE_MAP.get(
+                    str(annotation.type[1]).casefold(),
+                    AnnotationKind.NOTE,
+                )
+                info = annotation.info or {}
+                annotations.append(
+                    AnnotationInfo(
+                        page_index=page_index,
+                        xref=annotation.xref,
+                        kind=kind,
+                        rect=_rect(annotation.rect),
+                        content=str(info.get("content", "")),
+                        author=str(info.get("title", "")),
+                    )
+                )
+            return annotations
+
+    @serialized_pymupdf
+    def delete_annotation(self, page_index: int, xref: int) -> None:
+        with self._lock:
+            self._require_editable()
+            page = self._page(page_index)
+            for annotation in page.annots() or ():
+                if annotation.xref == xref:
+                    page.delete_annot(annotation)
+                    self._revision += 1
+                    return
+            raise PdfEditError("要删除的批注已不存在")
 
     @serialized_pymupdf
     def delete_content(self, page_index: int, rect: Rect) -> None:

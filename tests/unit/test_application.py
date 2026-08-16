@@ -19,4 +19,8 @@ def test_application_creates_three_column_main_window(qapp) -> None:
         "navigationDock",
         "propertiesDock",
     }
+    window.dark_theme_action.trigger()
+    assert "#202226" in app.styleSheet()
+    window.light_theme_action.trigger()
+    assert app.styleSheet() == ""
     window.close()

@@ -1,0 +1,1 @@
+"""Static FlowPDF application resources."""

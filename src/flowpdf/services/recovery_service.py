@@ -84,13 +84,16 @@ class RecoveryService:
             raise RecoveryError(f"恢复记录已损坏或无法读取：{candidate.name}") from exc
 
     def list_sessions(self) -> list[RecoveryRecord]:
-        records: list[RecoveryRecord] = []
+        return [record for _path, record in self.list_session_files()]
+
+    def list_session_files(self) -> list[tuple[Path, RecoveryRecord]]:
+        records: list[tuple[Path, RecoveryRecord]] = []
         for path in sorted(self.root.glob(f"{self._prefix}*.json")):
             try:
-                records.append(self.load(path))
+                records.append((path, self.load(path)))
             except RecoveryError:
                 continue
-        return sorted(records, key=lambda record: record.updated_at, reverse=True)
+        return sorted(records, key=lambda item: item[1].updated_at, reverse=True)
 
     def discard(self, path: str | Path) -> bool:
         try:

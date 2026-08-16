@@ -16,6 +16,7 @@ class PdfCommandType(StrEnum):
     REPLACE_TEXT = "replace_text"
     ADD_IMAGE = "add_image"
     ADD_ANNOTATION = "add_annotation"
+    DELETE_ANNOTATION = "delete_annotation"
     DELETE_CONTENT = "delete_content"
     MOVE_PAGE = "move_page"
     DELETE_PAGES = "delete_pages"
@@ -30,6 +31,7 @@ _DESCRIPTIONS = {
     PdfCommandType.REPLACE_TEXT: "修改已有文字",
     PdfCommandType.ADD_IMAGE: "添加图片",
     PdfCommandType.ADD_ANNOTATION: "添加批注",
+    PdfCommandType.DELETE_ANNOTATION: "删除批注",
     PdfCommandType.DELETE_CONTENT: "永久擦除",
     PdfCommandType.MOVE_PAGE: "移动页面",
     PdfCommandType.DELETE_PAGES: "删除页面",
@@ -169,6 +171,11 @@ class PdfMutationCommand(EditCommand):
             self.backend.add_annotation(
                 int(payload["page_index"]),
                 _payload_annotation(payload["annotation"]),
+            )
+        elif self.command_type is PdfCommandType.DELETE_ANNOTATION:
+            _backend_method(self.backend, "delete_annotation")(
+                int(payload["page_index"]),
+                int(payload["xref"]),
             )
         elif self.command_type is PdfCommandType.DELETE_CONTENT:
             self.backend.delete_content(int(payload["page_index"]), _payload_rect(payload["rect"]))

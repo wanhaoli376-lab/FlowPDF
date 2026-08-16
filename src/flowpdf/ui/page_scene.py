@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 
 from flowpdf.backends.base import PageInfo, RenderedPage, SearchHit
 from flowpdf.rendering.tile_cache import TileKey
+from flowpdf.utils.coordinates import PageTransform, Point, Rect
 
 
 class PageGraphicsItem(QGraphicsRectItem):
@@ -30,6 +31,24 @@ class PageGraphicsItem(QGraphicsRectItem):
     @property
     def raster_keys(self) -> frozenset[TileKey]:
         return frozenset(self._rasters)
+
+    def pdf_rect_to_local(self, rect: Rect) -> QRectF:
+        transformed = self._local_transform().pdf_rect_to_scene(rect)
+        return QRectF(
+            transformed.x0,
+            transformed.y0,
+            transformed.width,
+            transformed.height,
+        )
+
+    def scene_rect_to_pdf(self, rect: QRectF) -> Rect:
+        transform = self._scene_transform()
+        return transform.scene_rect_to_pdf(
+            Rect(rect.left(), rect.top(), rect.right(), rect.bottom())
+        )
+
+    def scene_point_to_pdf(self, x: float, y: float) -> Point:
+        return self._scene_transform().scene_to_pdf(Point(x, y))
 
     def apply_render(self, key: TileKey, rendered: RenderedPage) -> None:
         image = QImage(
@@ -69,13 +88,33 @@ class PageGraphicsItem(QGraphicsRectItem):
                 item.scene().removeItem(item)
         self._search_items.clear()
         for hit in hits:
-            rect = QRectF(hit.rect.x0, hit.rect.y0, hit.rect.width, hit.rect.height)
+            rect = self.pdf_rect_to_local(hit.rect)
             overlay = QGraphicsRectItem(rect, self)
             is_current = current == hit
             overlay.setBrush(QColor(255, 145 if is_current else 210, 0, 130 if is_current else 80))
             overlay.setPen(QPen(QColor("#F97316" if is_current else "#EAB308"), 1.0))
             overlay.setZValue(20)
             self._search_items.append(overlay)
+
+    def _local_transform(self) -> PageTransform:
+        crop = self.info.cropbox
+        return PageTransform(
+            page_width=crop.width,
+            page_height=crop.height,
+            rotation=self.info.rotation,
+            crop_origin=Point(crop.x0, crop.y0),
+        )
+
+    def _scene_transform(self) -> PageTransform:
+        crop = self.info.cropbox
+        position = self.scenePos()
+        return PageTransform(
+            page_width=crop.width,
+            page_height=crop.height,
+            rotation=self.info.rotation,
+            scene_origin=Point(position.x(), position.y()),
+            crop_origin=Point(crop.x0, crop.y0),
+        )
 
     def _remove_raster(self, key: TileKey) -> None:
         item = self._rasters.pop(key, None)

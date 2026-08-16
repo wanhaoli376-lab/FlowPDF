@@ -43,8 +43,11 @@ def test_listing_skips_corrupt_logs_and_discard_is_scoped(tmp_path) -> None:
     unrelated.write_text(json.dumps({"keep": True}), encoding="utf-8")
 
     sessions = service.list_sessions()
+    session_files = service.list_session_files()
 
     assert [session.document_id for session in sessions] == ["valid"]
+    assert session_files[0][0] == valid
+    assert session_files[0][1].document_id == "valid"
     assert service.discard(valid) is True
     assert service.discard(unrelated) is False
     assert unrelated.exists()
