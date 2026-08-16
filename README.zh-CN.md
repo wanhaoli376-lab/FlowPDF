@@ -11,8 +11,10 @@ FlowPDF 是一款面向 Windows 10/11 的本地 PDF 查看与编辑软件。界�
 
 ## 启动
 
+开发与正式构建基线使用 Python 3.14，项目声明兼容 Python 3.12–3.14。
+
 ```powershell
-py -3.12 -m venv .venv
+py -3.14 -m venv .venv
 .venv\Scripts\Activate.ps1
 python -m pip install -U pip
 pip install -e ".[dev]"
@@ -46,4 +48,3 @@ FlowPDF 不执行 PDF 内嵌 JavaScript，不自动打开外部链接或附件�
 项目自身尚未授予开源许可证。第三方依赖的初步核查见
 [`LICENSES/THIRD_PARTY.md`](LICENSES/THIRD_PARTY.md)。发布或分发前必须再次核对实际锁定版本的
 许可证文本，尤其是 PyMuPDF 的 AGPL/商业双重许可要求。
-
