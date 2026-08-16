@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flowpdf"
+version = "0.1.0a1"
+description = "Local-first PDF viewer and editor for Windows"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "FlowPDF contributors" }]
+dependencies = [
+  "PyMuPDF>=1.24,<2",
+  "PySide6>=6.7,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "Pillow>=10,<13",
+  "PyInstaller>=6,<7",
+  "pytest>=8,<10",
+  "ruff>=0.9,<1",
+]
+
+[project.gui-scripts]
+flowpdf = "flowpdf.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests"]
+markers = [
+  "gui: requires a Qt application",
+  "performance: local performance baseline",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
