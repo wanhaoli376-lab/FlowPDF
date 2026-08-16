@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QApplication, QDockWidget
 from flowpdf.application import create_application
 
 
-def test_application_creates_three_column_main_window() -> None:
+def test_application_creates_three_column_main_window(qapp) -> None:
     app, window = create_application(["flowpdf-test"])
 
     assert isinstance(app, QApplication)

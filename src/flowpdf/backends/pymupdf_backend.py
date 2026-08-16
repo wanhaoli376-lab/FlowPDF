@@ -31,6 +31,7 @@ from flowpdf.backends.base import (
     TextSpan,
     TextStyle,
 )
+from flowpdf.backends.pymupdf_runtime import serialized_pymupdf
 from flowpdf.editing.text_editor import layout_text
 from flowpdf.utils.coordinates import Point, Rect
 from flowpdf.utils.fonts import FontResolver
@@ -75,6 +76,7 @@ class PyMuPdfBackend(PdfBackend):
     def source_path(self) -> Path | None:
         return self._source_path
 
+    @serialized_pymupdf
     def open_document(self, path: str | Path, password: str | None = None) -> None:
         source = Path(path)
         try:
@@ -125,6 +127,7 @@ class PyMuPdfBackend(PdfBackend):
             self._can_edit = can_edit
             self._password = password if auth_result else None
 
+    @serialized_pymupdf
     def create_document(self, *, width: float = 595, height: float = 842) -> None:
         if width <= 0 or height <= 0:
             raise PdfEditError("空白页面尺寸必须大于 0")
@@ -141,6 +144,7 @@ class PyMuPdfBackend(PdfBackend):
             self._can_edit = True
             self._password = None
 
+    @serialized_pymupdf
     def close_document(self) -> None:
         with self._lock:
             if self._document is not None:
@@ -153,10 +157,12 @@ class PyMuPdfBackend(PdfBackend):
             self._can_edit = True
             self._password = None
 
+    @serialized_pymupdf
     def page_count(self) -> int:
         with self._lock:
             return self._require_document().page_count
 
+    @serialized_pymupdf
     def page_size(self, page_index: int) -> PageInfo:
         with self._lock:
             page = self._page(page_index)
@@ -171,6 +177,7 @@ class PyMuPdfBackend(PdfBackend):
                 mediabox=_rect(media),
             )
 
+    @serialized_pymupdf
     def render_page(self, page_index: int, scale: float, clip: Rect | None = None) -> RenderedPage:
         if not math.isfinite(scale) or scale <= 0 or scale > 16:
             raise PdfResourceLimitError("渲染缩放比例超出安全范围")
@@ -203,6 +210,7 @@ class PyMuPdfBackend(PdfBackend):
                 scale=scale,
             )
 
+    @serialized_pymupdf
     def extract_text_spans(self, page_index: int) -> list[TextSpan]:
         with self._lock:
             page = self._page(page_index)
@@ -236,6 +244,7 @@ class PyMuPdfBackend(PdfBackend):
                         )
             return spans
 
+    @serialized_pymupdf
     def search_text(self, query: str) -> list[SearchHit]:
         needle = query.strip()
         if not needle:
@@ -254,6 +263,7 @@ class PyMuPdfBackend(PdfBackend):
                     return hits[:10_000]
             return hits
 
+    @serialized_pymupdf
     def add_text(self, page_index: int, rect: Rect, text: str, style: TextStyle) -> Rect:
         if not text:
             raise PdfEditError("文字内容不能为空")
@@ -321,6 +331,7 @@ class PyMuPdfBackend(PdfBackend):
             self._revision += 1
             return _rect(target)
 
+    @serialized_pymupdf
     def replace_text(self, page_index: int, rect: Rect, text: str, style: TextStyle) -> Rect:
         with self._lock:
             self._require_editable()
@@ -328,6 +339,7 @@ class PyMuPdfBackend(PdfBackend):
             result = self.add_text(page_index, rect, text, style)
             return result
 
+    @serialized_pymupdf
     def add_image(self, page_index: int, rect: Rect, image_path: str | Path) -> None:
         source = Path(image_path)
         try:
@@ -365,6 +377,7 @@ class PyMuPdfBackend(PdfBackend):
                 raise PdfEditError("图片格式无效或无法插入") from exc
             self._revision += 1
 
+    @serialized_pymupdf
     def list_images(self, page_index: int) -> list[ImageInfo]:
         with self._lock:
             page = self._page(page_index)
@@ -381,6 +394,7 @@ class PyMuPdfBackend(PdfBackend):
                 )
             return output
 
+    @serialized_pymupdf
     def add_annotation(self, page_index: int, annotation: AnnotationSpec) -> None:
         self._validate_opacity(annotation.opacity)
         with self._lock:
@@ -401,11 +415,13 @@ class PyMuPdfBackend(PdfBackend):
             annot.update()
             self._revision += 1
 
+    @serialized_pymupdf
     def delete_content(self, page_index: int, rect: Rect) -> None:
         with self._lock:
             self._require_editable()
             self._redact(page_index, rect, images=2, graphics=2, fill=True)
 
+    @serialized_pymupdf
     def move_page(self, old_index: int, new_index: int) -> None:
         with self._lock:
             self._require_editable()
@@ -421,6 +437,7 @@ class PyMuPdfBackend(PdfBackend):
             document.select(order)
             self._revision += 1
 
+    @serialized_pymupdf
     def delete_pages(self, page_indices: list[int]) -> None:
         with self._lock:
             self._require_editable()
@@ -435,6 +452,7 @@ class PyMuPdfBackend(PdfBackend):
             document.delete_pages(unique)
             self._revision += 1
 
+    @serialized_pymupdf
     def rotate_pages(self, page_indices: list[int], degrees: int = 90) -> None:
         if degrees % 90:
             raise PdfEditError("页面旋转角度必须是 90 度的倍数")
@@ -446,6 +464,7 @@ class PyMuPdfBackend(PdfBackend):
             if page_indices:
                 self._revision += 1
 
+    @serialized_pymupdf
     def insert_blank_page(
         self,
         insert_index: int,
@@ -463,6 +482,7 @@ class PyMuPdfBackend(PdfBackend):
             document.new_page(pno=insert_index, width=width, height=height)
             self._revision += 1
 
+    @serialized_pymupdf
     def duplicate_page(self, page_index: int, insert_index: int | None = None) -> None:
         with self._lock:
             self._require_editable()
@@ -474,6 +494,7 @@ class PyMuPdfBackend(PdfBackend):
             document.copy_page(page_index, to=target)
             self._revision += 1
 
+    @serialized_pymupdf
     def insert_pages(
         self,
         source_path: str | Path,
@@ -502,6 +523,7 @@ class PyMuPdfBackend(PdfBackend):
                 raise PdfEditError("无法插入此 PDF，文件可能损坏或受限制") from exc
             self._revision += 1
 
+    @serialized_pymupdf
     def export_pages(self, page_indices: list[int], output_path: str | Path) -> None:
         with self._lock:
             source = self._require_document()
@@ -520,6 +542,7 @@ class PyMuPdfBackend(PdfBackend):
             finally:
                 output.close()
 
+    @serialized_pymupdf
     def save_document(self, output_path: str | Path) -> None:
         destination = Path(output_path)
         if not destination.parent.is_dir():
@@ -535,6 +558,7 @@ class PyMuPdfBackend(PdfBackend):
             except (OSError, RuntimeError, ValueError) as exc:
                 raise PdfSaveError(f"无法保存 PDF：{destination.name}") from exc
 
+    @serialized_pymupdf
     def validate_saved_document(self, path: str | Path) -> DocumentValidation:
         candidate: pymupdf.Document | None = None
         source = Path(path)
@@ -561,6 +585,7 @@ class PyMuPdfBackend(PdfBackend):
             if candidate is not None:
                 candidate.close()
 
+    @serialized_pymupdf
     def document_bytes(self) -> bytes:
         with self._lock:
             document = self._require_document()
@@ -576,6 +601,7 @@ class PyMuPdfBackend(PdfBackend):
             except (RuntimeError, ValueError) as exc:
                 raise PdfSaveError("无法创建文档工作快照") from exc
 
+    @serialized_pymupdf
     def load_bytes(self, data: bytes) -> None:
         if not data or len(data) > self._limits.max_source_bytes:
             raise PdfResourceLimitError("文档快照为空或过大")
@@ -596,6 +622,7 @@ class PyMuPdfBackend(PdfBackend):
             self._revision = revision + 1
             self._can_edit = True
 
+    @serialized_pymupdf
     def is_probably_scanned(self, page_index: int) -> bool:
         with self._lock:
             page = self._page(page_index)
