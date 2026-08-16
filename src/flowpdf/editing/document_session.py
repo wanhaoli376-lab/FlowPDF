@@ -10,7 +10,11 @@ from flowpdf.backends.base import (
     PdfError,
 )
 from flowpdf.editing.command_stack import CommandStack
-from flowpdf.editing.pdf_commands import PdfCommandType, PdfMutationCommand
+from flowpdf.editing.pdf_commands import (
+    PdfCommandType,
+    PdfHistoryLimitError,
+    PdfMutationCommand,
+)
 from flowpdf.services.recovery_service import RecoveryService
 from flowpdf.services.save_service import SafeSaveService, SaveResult
 from flowpdf.utils.paths import suggest_edited_copy
@@ -30,14 +34,23 @@ class DocumentSession:
         recovery_service: RecoveryService,
         save_service: SafeSaveService | None = None,
         max_history: int = 100,
+        max_history_bytes: int = 256 * 1024 * 1024,
     ) -> None:
         self.backend = backend
         self.recovery_service = recovery_service
         self.save_service = save_service or SafeSaveService()
-        self.command_stack = CommandStack(max_depth=max_history)
+        self.command_stack = CommandStack(
+            max_depth=max_history,
+            max_history_bytes=max_history_bytes,
+        )
+        self.max_history_bytes = max_history_bytes
         self.source_path: Path | None = None
         self.saved_path: Path | None = None
         self._recovery_path: Path | None = None
+        self._needs_initial_save = False
+        self._source_bytes: bytes | None = None
+        self._source_size_bytes = 0
+        self._password: str | None = None
         self._listeners: list[Callable[[], None]] = []
         self.command_stack.add_listener(self._notify)
 
@@ -47,7 +60,7 @@ class DocumentSession:
 
     @property
     def is_dirty(self) -> bool:
-        return self.command_stack.is_dirty
+        return self._needs_initial_save or self.command_stack.is_dirty
 
     @property
     def page_count(self) -> int:
@@ -68,13 +81,22 @@ class DocumentSession:
         self._guard_replace_session()
         try:
             self.backend.open_document(path, password=password)
+            source_path = Path(path).resolve(strict=True)
+            source_bytes = source_path.read_bytes()
         except PdfError:
             raise
-        self.source_path = Path(path).resolve(strict=True)
+        except OSError as exc:
+            self.backend.close_document()
+            raise DocumentSessionError("PDF 已打开，但无法建立只读工作副本") from exc
+        self.source_path = source_path
         self.saved_path = None
         self.command_stack.clear()
         self.command_stack.mark_clean()
         self._recovery_path = None
+        self._needs_initial_save = False
+        self._source_bytes = source_bytes
+        self._source_size_bytes = len(source_bytes)
+        self._password = password
         self._notify()
 
     def create_new(self, *, width: float = 595, height: float = 842) -> None:
@@ -85,6 +107,10 @@ class DocumentSession:
         self.command_stack.clear()
         self.command_stack.mark_clean()
         self._recovery_path = None
+        self._needs_initial_save = True
+        self._source_bytes = None
+        self._source_size_bytes = 0
+        self._password = None
         self._notify()
 
     def execute(self, command_type: PdfCommandType, **payload: object) -> None:
@@ -95,8 +121,16 @@ class DocumentSession:
             if key in payload:
                 secrets[key] = payload.pop(key)
         self.command_stack.push(
-            PdfMutationCommand(self.backend, command_type, payload, secrets=secrets)
+            PdfMutationCommand(
+                self.backend,
+                command_type,
+                payload,
+                secrets=secrets,
+                max_history_bytes=self.max_history_bytes,
+                source_size_bytes=self._source_size_bytes,
+            )
         )
+        self._source_bytes = None
 
     def undo(self) -> bool:
         return self.command_stack.undo()
@@ -124,23 +158,49 @@ class DocumentSession:
             if record.source_path:
                 self.backend.open_document(record.source_path, password=password)
                 self.source_path = Path(record.source_path).resolve(strict=True)
+                self._source_bytes = self.source_path.read_bytes()
+                self._source_size_bytes = len(self._source_bytes)
+                self._password = password
             else:
                 self.backend.create_document()
                 self.source_path = None
-            initial = self.backend.document_bytes()
+                self._source_bytes = None
+                self._source_size_bytes = 0
+                self._password = None
+            if (
+                record.commands
+                and self._source_bytes is not None
+                and len(self._source_bytes) > self.max_history_bytes // 4
+            ):
+                raise PdfHistoryLimitError("源 PDF 超过安全恢复快照上限，请先拆分文档")
+            initial = self.backend.document_bytes() if record.commands else None
             self.command_stack.clear()
             for command_record in record.commands:
-                command = PdfMutationCommand.from_record(self.backend, command_record)
+                command = PdfMutationCommand.from_record(
+                    self.backend,
+                    command_record,
+                    max_history_bytes=self.max_history_bytes,
+                    source_size_bytes=self._source_size_bytes,
+                )
                 self.command_stack.push(command)
+            if record.commands:
+                self._source_bytes = None
         except (PasswordRequiredError, InvalidPasswordError):
             raise
         except (PdfError, OSError, ValueError, KeyError) as exc:
-            if self.is_open and initial is not None:
-                self.backend.load_bytes(initial)
+            if self.is_open:
+                if initial is not None:
+                    self.backend.load_bytes(initial)
+                else:
+                    self.backend.close_document()
                 self.command_stack.clear()
+            self._source_bytes = None
+            self._source_size_bytes = 0
+            self._password = None
             raise DocumentSessionError(f"无法恢复编辑会话：{exc}") from exc
         self.saved_path = Path(record.output_path) if record.output_path else None
         self._recovery_path = Path(recovery_path)
+        self._needs_initial_save = not bool(record.source_path)
         self._notify()
 
     def suggested_save_path(self) -> Path | None:
@@ -149,6 +209,12 @@ class DocumentSession:
         if self.source_path is None:
             return None
         return suggest_edited_copy(self.source_path)
+
+    def render_snapshot_data(self) -> tuple[bytes, str | None]:
+        """Return one immutable renderer input without reserializing a pristine source."""
+        if self._source_bytes is not None and not self.command_stack.has_applied_commands:
+            return self._source_bytes, self._password
+        return self.backend.document_bytes(), self._password
 
     def save(
         self,
@@ -171,6 +237,7 @@ class DocumentSession:
         )
         self.saved_path = result.output_path
         self.command_stack.mark_clean()
+        self._needs_initial_save = False
         if self._recovery_path is not None:
             self.recovery_service.discard(self._recovery_path)
             self._recovery_path = None
@@ -185,6 +252,10 @@ class DocumentSession:
         self.saved_path = None
         self.command_stack.clear()
         self._recovery_path = None
+        self._needs_initial_save = False
+        self._source_bytes = None
+        self._source_size_bytes = 0
+        self._password = None
         self._notify()
 
     def _guard_replace_session(self) -> None:

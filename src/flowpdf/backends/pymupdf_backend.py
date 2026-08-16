@@ -3,9 +3,13 @@ from __future__ import annotations
 import hashlib
 import io
 import math
+import os
+import uuid
+import warnings
 from contextlib import suppress
 from pathlib import Path
 from threading import RLock
+from typing import Protocol
 
 import pymupdf
 from PIL import Image, UnidentifiedImageError
@@ -58,6 +62,12 @@ _ANNOTATION_TYPE_MAP = {
 }
 
 
+class ArtifactRegistry(Protocol):
+    def register(self, artifact: str | Path) -> None: ...
+
+    def unregister(self, artifact: str | Path) -> None: ...
+
+
 class PyMuPdfBackend(PdfBackend):
     """PyMuPDF adapter; no Qt types cross this engine seam."""
 
@@ -66,15 +76,18 @@ class PyMuPdfBackend(PdfBackend):
         *,
         limits: PdfResourceLimits | None = None,
         font_resolver: FontResolver | None = None,
+        artifact_registry: ArtifactRegistry | None = None,
     ) -> None:
         self._limits = limits or PdfResourceLimits()
         self._font_resolver = font_resolver or FontResolver()
+        self._artifact_registry = artifact_registry
         self._document: pymupdf.Document | None = None
         self._source_path: Path | None = None
         self._document_id = ""
         self._revision = 0
         self._can_edit = True
         self._password: str | None = None
+        self._owner_authenticated = False
         self._lock = RLock()
 
     @property
@@ -139,6 +152,7 @@ class PyMuPdfBackend(PdfBackend):
             self._revision = 0
             self._can_edit = can_edit
             self._password = password if auth_result else None
+            self._owner_authenticated = auth_result >= 4
 
     @serialized_pymupdf
     def create_document(self, *, width: float = 595, height: float = 842) -> None:
@@ -156,6 +170,7 @@ class PyMuPdfBackend(PdfBackend):
             self._revision = 0
             self._can_edit = True
             self._password = None
+            self._owner_authenticated = False
 
     @serialized_pymupdf
     def close_document(self) -> None:
@@ -169,6 +184,7 @@ class PyMuPdfBackend(PdfBackend):
             self._revision = 0
             self._can_edit = True
             self._password = None
+            self._owner_authenticated = False
 
     @serialized_pymupdf
     def page_count(self) -> int:
@@ -283,6 +299,7 @@ class PyMuPdfBackend(PdfBackend):
         self._validate_opacity(style.opacity)
         with self._lock:
             self._require_editable()
+            self._ensure_object_capacity(64)
             page = self._page(page_index)
             font = self._font_resolver.resolve(style.font_family, text=text)
             font_name = "helv"
@@ -364,8 +381,10 @@ class PyMuPdfBackend(PdfBackend):
             raise PdfEditError("仅支持 PNG、JPEG 和 WEBP 图片")
         if size <= 0 or size > self._limits.max_image_bytes:
             raise PdfResourceLimitError("图片为空或超过大小限制")
+        self._validate_image_file(source)
         with self._lock:
             self._require_editable()
+            self._ensure_object_capacity(64)
             page = self._page(page_index)
             target = _fitz_rect(rect) & page.rect
             if target.is_empty:
@@ -412,6 +431,7 @@ class PyMuPdfBackend(PdfBackend):
         self._validate_opacity(annotation.opacity)
         with self._lock:
             self._require_editable()
+            self._ensure_object_capacity(16)
             page = self._page(page_index)
             target = _fitz_rect(annotation.rect) & page.rect
             if target.is_empty:
@@ -527,6 +547,9 @@ class PyMuPdfBackend(PdfBackend):
             document = self._require_document()
             if not 0 <= insert_index <= document.page_count:
                 raise PdfEditError("插入页码超出范围")
+            if document.page_count >= self._limits.max_pages:
+                raise PdfResourceLimitError("PDF 页数已达到安全上限")
+            self._ensure_object_capacity(8)
             document.new_page(pno=insert_index, width=width, height=height)
             self._revision += 1
 
@@ -539,6 +562,9 @@ class PyMuPdfBackend(PdfBackend):
             target = page_index + 1 if insert_index is None else insert_index
             if not 0 <= target <= document.page_count:
                 raise PdfEditError("复制页面的插入位置超出范围")
+            if document.page_count >= self._limits.max_pages:
+                raise PdfResourceLimitError("PDF 页数已达到安全上限")
+            self._ensure_object_capacity(8)
             document.copy_page(page_index, to=target)
             self._revision += 1
 
@@ -550,45 +576,109 @@ class PyMuPdfBackend(PdfBackend):
         *,
         password: str | None = None,
     ) -> None:
+        source_file = Path(source_path)
+        try:
+            source_file = source_file.resolve(strict=True)
+            source_size = source_file.stat().st_size
+        except OSError as exc:
+            raise PdfEditError("无法读取待插入的 PDF") from exc
+        if source_size <= 0 or source_size > self._limits.max_source_bytes:
+            raise PdfResourceLimitError("待插入的 PDF 为空或超过大小限制")
         with self._lock:
             self._require_editable()
             document = self._require_document()
             if not 0 <= insert_index <= document.page_count:
                 raise PdfEditError("插入页码超出范围")
+            source: pymupdf.Document | None = None
             try:
-                source = pymupdf.open(Path(source_path))
+                source = pymupdf.open(source_file)
                 if source.needs_pass and (password is None or not source.authenticate(password)):
-                    source.close()
                     raise PasswordRequiredError("待插入的 PDF 需要正确密码")
+                self._validate_document(source)
                 if document.page_count + source.page_count > self._limits.max_pages:
-                    source.close()
                     raise PdfResourceLimitError("合并后的页数超过安全上限")
+                if (
+                    document.xref_length() + source.xref_length() + 16
+                    > self._limits.max_xref_objects
+                ):
+                    raise PdfResourceLimitError("合并后的内部对象数量超过安全上限")
                 document.insert_pdf(source, start_at=insert_index, annots=True, widgets=True)
-                source.close()
             except (PasswordRequiredError, PdfResourceLimitError):
                 raise
+            except PdfOpenError as exc:
+                raise PdfEditError(f"无法插入此 PDF：{exc}") from exc
             except (OSError, RuntimeError, ValueError, pymupdf.FileDataError) as exc:
                 raise PdfEditError("无法插入此 PDF，文件可能损坏或受限制") from exc
+            finally:
+                if source is not None:
+                    source.close()
             self._revision += 1
 
     @serialized_pymupdf
     def export_pages(self, page_indices: list[int], output_path: str | Path) -> None:
         with self._lock:
             source = self._require_document()
+            if self._password is not None and not self._owner_authenticated:
+                raise PdfPermissionError("加密 PDF 需要使用所有者密码才能导出页面")
             unique = sorted(set(page_indices))
             if not unique:
                 raise PdfEditError("没有选择要导出的页面")
             for index in unique:
                 self._validate_page_index(index)
-            output = pymupdf.open()
-            for index in unique:
-                output.insert_pdf(source, from_page=index, to_page=index)
+            destination = Path(output_path)
+            if not destination.parent.is_dir():
+                raise PdfSaveError("导出目录不存在")
+            if destination.is_symlink():
+                raise PdfSaveError("为保护数据，不能导出到符号链接目标")
+            if self._source_path is not None and _same_path(destination, self._source_path):
+                raise PdfSaveError("不能用页面导出覆盖当前源 PDF")
+            temporary = destination.parent / f".flowpdf-export-{uuid.uuid4().hex}.tmp.pdf"
+            output: pymupdf.Document | None = pymupdf.open()
+            candidate: pymupdf.Document | None = None
             try:
-                output.ez_save(Path(output_path), encryption=pymupdf.PDF_ENCRYPT_NONE)
-            except (OSError, RuntimeError, ValueError) as exc:
-                raise PdfSaveError("无法导出所选页面") from exc
-            finally:
+                if self._artifact_registry is not None:
+                    self._artifact_registry.register(temporary)
+                for index in unique:
+                    output.insert_pdf(source, from_page=index, to_page=index)
+                save_options: dict[str, object] = {
+                    "encryption": pymupdf.PDF_ENCRYPT_NONE,
+                }
+                if self._password is not None:
+                    save_options = {
+                        "encryption": pymupdf.PDF_ENCRYPT_AES_256,
+                        "owner_pw": self._password,
+                        "user_pw": self._password,
+                        "permissions": source.permissions,
+                    }
+                output.ez_save(temporary, **save_options)
                 output.close()
+                output = None
+                candidate = pymupdf.open(temporary)
+                if candidate.needs_pass and (
+                    self._password is None or not candidate.authenticate(self._password)
+                ):
+                    raise PdfSaveError("导出结果的密码保护验证失败")
+                self._validate_document(candidate)
+                if candidate.page_count != len(unique) or temporary.stat().st_size <= 0:
+                    raise PdfSaveError("导出结果的页数或文件大小验证失败")
+                candidate.close()
+                candidate = None
+                os.replace(temporary, destination)
+            except PdfSaveError:
+                raise
+            except Exception as exc:
+                raise PdfSaveError(f"无法安全导出所选页面：{destination.name}") from exc
+            finally:
+                if output is not None:
+                    output.close()
+                if candidate is not None:
+                    candidate.close()
+                if temporary.exists() and not temporary.is_symlink():
+                    with suppress(OSError):
+                        temporary.unlink()
+                if self._artifact_registry is not None and not temporary.exists():
+                    with suppress(OSError, ValueError):
+                        self._artifact_registry.unregister(temporary)
 
     @serialized_pymupdf
     def save_document(self, output_path: str | Path) -> None:
@@ -644,7 +734,7 @@ class PyMuPdfBackend(PdfBackend):
                     deflate_images=True,
                     deflate_fonts=True,
                     use_objstms=1,
-                    encryption=pymupdf.PDF_ENCRYPT_NONE,
+                    encryption=pymupdf.PDF_ENCRYPT_KEEP,
                 )
             except (RuntimeError, ValueError) as exc:
                 raise PdfSaveError("无法创建文档工作快照") from exc
@@ -655,7 +745,14 @@ class PyMuPdfBackend(PdfBackend):
             raise PdfResourceLimitError("文档快照为空或过大")
         try:
             candidate = pymupdf.open(stream=data, filetype="pdf")
+            if candidate.needs_pass and (
+                self._password is None or not candidate.authenticate(self._password)
+            ):
+                candidate.close()
+                raise PdfOpenError("无法使用当前会话密码恢复加密快照")
             self._validate_document(candidate)
+        except PdfOpenError:
+            raise
         except (RuntimeError, ValueError, pymupdf.FileDataError) as exc:
             raise PdfOpenError("无法恢复文档工作快照") from exc
         with self._lock:
@@ -693,6 +790,7 @@ class PyMuPdfBackend(PdfBackend):
         graphics: int,
         fill: bool,
     ) -> None:
+        self._ensure_object_capacity(64)
         page = self._page(page_index)
         target = _fitz_rect(rect) & page.rect
         if target.is_empty:
@@ -766,6 +864,25 @@ class PyMuPdfBackend(PdfBackend):
         except (OSError, UnidentifiedImageError, ValueError) as exc:
             raise PdfEditError("WEBP 图片损坏或无法解码") from exc
 
+    def _validate_image_file(self, source: Path) -> None:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                with Image.open(source) as image:
+                    if image.width * image.height > self._limits.max_render_pixels:
+                        raise PdfResourceLimitError("图片像素数量超过安全上限")
+                    image.verify()
+        except PdfResourceLimitError:
+            raise
+        except (
+            Image.DecompressionBombError,
+            Image.DecompressionBombWarning,
+            OSError,
+            UnidentifiedImageError,
+            ValueError,
+        ) as exc:
+            raise PdfEditError("图片损坏、尺寸异常或无法解码") from exc
+
     def _text_editability(self, font: str, text: str) -> TextEditability:
         base = font.casefold().replace("bold", "").replace("italic", "").strip(" -")
         if base in _BASE14_FONTS:
@@ -780,6 +897,8 @@ class PyMuPdfBackend(PdfBackend):
             raise PdfOpenError("PDF 没有可显示的页面")
         if document.page_count > self._limits.max_pages:
             raise PdfResourceLimitError("PDF 页数超过安全上限")
+        if document.xref_length() > self._limits.max_xref_objects:
+            raise PdfResourceLimitError("PDF 内部对象数量超过安全上限")
         for page_index in range(document.page_count):
             rect = document.load_page(page_index).rect
             if max(rect.width, rect.height) > self._limits.max_page_dimension:
@@ -789,6 +908,11 @@ class PyMuPdfBackend(PdfBackend):
         document = self._require_document()
         if not 0 <= page_index < document.page_count:
             raise PdfEditError("页码超出范围")
+
+    def _ensure_object_capacity(self, additional: int) -> None:
+        document = self._require_document()
+        if document.xref_length() + additional > self._limits.max_xref_objects:
+            raise PdfResourceLimitError("PDF 内部对象数量已接近安全上限")
 
     def _page(self, page_index: int) -> pymupdf.Page:
         self._validate_page_index(page_index)
@@ -817,3 +941,12 @@ def _rect(rect: pymupdf.Rect) -> Rect:
 def _fitz_rect(rect: Rect) -> pymupdf.Rect:
     normalized = rect.normalized()
     return pymupdf.Rect(normalized.x0, normalized.y0, normalized.x1, normalized.y1)
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    try:
+        if left.exists() and right.exists():
+            return os.path.samefile(left, right)
+    except OSError:
+        pass
+    return str(left.resolve(strict=False)).casefold() == str(right.resolve(strict=False)).casefold()

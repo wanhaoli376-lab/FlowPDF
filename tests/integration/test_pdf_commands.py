@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import pytest
 from tests.generate_test_pdfs import generate_test_pdfs
 
 from flowpdf.backends.pymupdf_backend import PyMuPdfBackend
 from flowpdf.editing.command_stack import CommandStack
-from flowpdf.editing.pdf_commands import PdfCommandType, PdfMutationCommand
+from flowpdf.editing.pdf_commands import (
+    PdfCommandType,
+    PdfHistoryLimitError,
+    PdfMutationCommand,
+)
 
 
 def _page_text(backend: PyMuPdfBackend, page: int) -> str:
@@ -62,3 +67,26 @@ def test_command_serialization_contains_replay_data_but_no_pdf_snapshot(tmp_path
         "degrees": 90,
     }
     assert all("snapshot" not in key for key in record)
+
+
+def test_oversized_source_is_rejected_before_creating_any_snapshot(tmp_path) -> None:
+    source = tmp_path / "large-source.pdf"
+    source.write_bytes(b"x")
+
+    class SnapshotTrap:
+        def __init__(self, source_path):
+            self.source_path = source_path
+
+        def document_bytes(self):
+            raise AssertionError("snapshot must not be allocated")
+
+    command = PdfMutationCommand(
+        SnapshotTrap(source),
+        PdfCommandType.DELETE_PAGES,
+        {"page_indices": [0]},
+        max_history_bytes=3,
+        source_size_bytes=1,
+    )
+
+    with pytest.raises(PdfHistoryLimitError, match="安全编辑快照上限"):
+        command.execute()

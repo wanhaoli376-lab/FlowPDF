@@ -48,6 +48,7 @@ class DocumentView(QGraphicsView):
         self._continuous = True
         self._last_error = ""
         self._owner = f"document-view-{id(self)}"
+        self._desired_keys: set[TileKey] = set()
         self._tool = ToolMode.SELECT
         self._selection_start = None
         self._selection_page = None
@@ -95,6 +96,7 @@ class DocumentView(QGraphicsView):
         revision: int = 0,
     ) -> None:
         self.scheduler.cancel_owner_obsolete(self._owner, set())
+        self._desired_keys.clear()
         self._source = source
         self._page_infos = list(page_infos)
         self._revision = revision
@@ -111,6 +113,7 @@ class DocumentView(QGraphicsView):
         revision: int,
     ) -> None:
         self.scheduler.cancel_owner_obsolete(self._owner, set())
+        self._desired_keys.clear()
         self._source = source
         self._revision = revision
         self.page_scene.clear_rasters()
@@ -123,6 +126,7 @@ class DocumentView(QGraphicsView):
     def clear_document(self) -> None:
         self._cancel_region_selection()
         self.scheduler.cancel_owner_obsolete(self._owner, set())
+        self._desired_keys.clear()
         self._source = None
         self._page_infos.clear()
         self.page_scene.clear_pages()
@@ -346,6 +350,8 @@ class DocumentView(QGraphicsView):
         for page_index in sorted(request_indices):
             is_visible = page_index in visible_indices
             desired.update(self._request_page(page_index, viewport_rect, is_visible))
+        self._desired_keys = desired
+        self.page_scene.retain_rasters(self._raster_retention_keys())
         self.scheduler.cancel_owner_obsolete(self._owner, desired)
 
     def _request_page(
@@ -446,9 +452,22 @@ class DocumentView(QGraphicsView):
             or key.document_id != self._source.document_id
             or key.revision != self._revision
             or key.purpose != "page"
+            or key not in self._desired_keys
         ):
             return
         self.page_scene.apply_render(key, rendered)
+        self.page_scene.retain_rasters(self._raster_retention_keys())
+
+    def _raster_retention_keys(self) -> set[TileKey]:
+        retained = set(self._desired_keys)
+        for page in self.page_scene.pages:
+            desired = {key for key in self._desired_keys if key.page_index == page.page_index}
+            if not desired:
+                continue
+            full_page_keys = {key for key in desired if key.tile is None}
+            if page.raster_keys.isdisjoint(full_page_keys):
+                retained.update(page.raster_keys)
+        return retained
 
     def _on_tile_failed(self, key: TileKey, message: str) -> None:
         if self._source is not None and key.document_id == self._source.document_id:

@@ -5,7 +5,15 @@ import pytest
 from PIL import Image
 from tests.generate_test_pdfs import generate_test_pdfs
 
-from flowpdf.backends.base import AnnotationKind, AnnotationSpec, TextStyle
+from flowpdf.backends.base import (
+    AnnotationKind,
+    AnnotationSpec,
+    PdfPermissionError,
+    PdfResourceLimitError,
+    PdfResourceLimits,
+    PdfSaveError,
+    TextStyle,
+)
 from flowpdf.backends.pymupdf_backend import PyMuPdfBackend
 from flowpdf.utils.coordinates import Rect
 
@@ -113,6 +121,96 @@ def test_insert_image_and_annotation_survive_save(pdfs, tmp_path) -> None:
     assert len(document[0].get_images(full=True)) >= 1
     assert sum(1 for _ in document[0].annots()) == 1
     document.close()
+
+
+def test_image_decode_and_inserted_pdf_are_resource_limited(pdfs, tmp_path) -> None:
+    image_path = tmp_path / "too-many-pixels.png"
+    Image.new("RGB", (11, 10), "red").save(image_path)
+    backend = PyMuPdfBackend(limits=PdfResourceLimits(max_render_pixels=100))
+    backend.create_document()
+
+    with pytest.raises(PdfResourceLimitError, match="像素"):
+        backend.add_image(0, Rect(10, 10, 100, 100), image_path)
+
+    limited = PyMuPdfBackend(limits=PdfResourceLimits(max_source_bytes=100))
+    limited.create_document()
+    with pytest.raises(PdfResourceLimitError, match="大小限制"):
+        limited.insert_pages(pdfs["normal"], 1)
+
+    object_limited = PyMuPdfBackend(limits=PdfResourceLimits(max_xref_objects=1))
+    with pytest.raises(PdfResourceLimitError, match="对象数量"):
+        object_limited.open_document(pdfs["normal"])
+
+
+def test_export_from_encrypted_pdf_keeps_password_protection(pdfs, tmp_path) -> None:
+    restricted = PyMuPdfBackend()
+    restricted.open_document(pdfs["encrypted"], password="flowpdf-test")
+    with pytest.raises(PdfPermissionError, match="所有者密码"):
+        restricted.export_pages([0], tmp_path / "restricted.pdf")
+
+    modify_only_path = tmp_path / "modify-only.pdf"
+    modify_only = pymupdf.open()
+    modify_only.new_page()
+    modify_only.save(
+        modify_only_path,
+        encryption=pymupdf.PDF_ENCRYPT_AES_256,
+        owner_pw="owner",
+        user_pw="user",
+        permissions=pymupdf.PDF_PERM_MODIFY,
+    )
+    modify_only.close()
+    user_session = PyMuPdfBackend()
+    user_session.open_document(modify_only_path, password="user")
+    with pytest.raises(PdfPermissionError, match="所有者密码"):
+        user_session.export_pages([0], tmp_path / "must-not-escalate.pdf")
+
+    owner = PyMuPdfBackend()
+    owner.open_document(pdfs["encrypted"], password="flowpdf-owner")
+    output = tmp_path / "encrypted-export.pdf"
+    owner.export_pages([0], output)
+
+    exported = pymupdf.open(output)
+    try:
+        assert bool(exported.needs_pass) is True
+        assert exported.authenticate("flowpdf-owner") > 0
+        assert exported.page_count == 1
+    finally:
+        exported.close()
+
+
+def test_page_and_object_limits_cannot_be_crossed_by_editing(pdfs) -> None:
+    page_limited = PyMuPdfBackend(limits=PdfResourceLimits(max_pages=2))
+    page_limited.open_document(pdfs["normal"])
+    with pytest.raises(PdfResourceLimitError, match="页数"):
+        page_limited.insert_blank_page(1)
+    with pytest.raises(PdfResourceLimitError, match="页数"):
+        page_limited.duplicate_page(0)
+
+    with pymupdf.open(pdfs["normal"]) as target, pymupdf.open(pdfs["landscape"]) as source:
+        object_limit = max(target.xref_length(), source.xref_length()) + 16
+    object_limited = PyMuPdfBackend(limits=PdfResourceLimits(max_xref_objects=object_limit))
+    object_limited.open_document(pdfs["normal"])
+    with pytest.raises(PdfResourceLimitError, match="对象数量"):
+        object_limited.insert_pages(pdfs["landscape"], object_limited.page_count())
+
+
+def test_export_is_atomic_and_never_overwrites_the_source(pdfs, tmp_path, monkeypatch) -> None:
+    backend = PyMuPdfBackend()
+    backend.open_document(pdfs["normal"])
+    target = tmp_path / "existing.pdf"
+    target.write_bytes(b"existing target")
+
+    def fail_replace(source, destination):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr("flowpdf.backends.pymupdf_backend.os.replace", fail_replace)
+    with pytest.raises(PdfSaveError, match="无法安全导出"):
+        backend.export_pages([0], target)
+
+    assert target.read_bytes() == b"existing target"
+    assert list(tmp_path.glob(".flowpdf-export-*.tmp.pdf")) == []
+    with pytest.raises(PdfSaveError, match="不能用页面导出覆盖"):
+        backend.export_pages([0], pdfs["normal"])
 
 
 def test_page_move_delete_rotate_insert_and_merge_round_trip(pdfs, tmp_path) -> None:

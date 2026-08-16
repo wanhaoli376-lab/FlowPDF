@@ -10,10 +10,11 @@ from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QPointF, Qt, QT
 from PySide6.QtTest import QTest
 from tests.generate_test_pdfs import generate_test_pdfs
 
-from flowpdf.backends.base import PageInfo
+from flowpdf.backends.base import PageInfo, RenderedPage
 from flowpdf.backends.pymupdf_backend import PyMuPdfBackend
 from flowpdf.editing.tools import ToolMode
 from flowpdf.rendering.render_scheduler import RenderScheduler, RenderSource
+from flowpdf.rendering.tile_cache import TileKey
 from flowpdf.ui.document_view import DocumentView
 from flowpdf.utils.coordinates import Rect
 
@@ -111,5 +112,28 @@ def test_region_tool_emits_pdf_coordinates_and_escape_returns_to_select(qapp) ->
 
     QTest.keyClick(view, Qt.Key.Key_Escape)
     assert view.tool is ToolMode.SELECT
+    view.close()
+    assert scheduler.shutdown()
+
+
+def test_zoom_keeps_previous_raster_until_new_full_page_is_ready(qapp) -> None:
+    scheduler = RenderScheduler(max_cache_bytes=1024 * 1024, max_threads=1)
+    view = DocumentView(scheduler)
+    info = PageInfo(100, 100, 0, Rect(0, 0, 100, 100), Rect(0, 0, 100, 100))
+    view._source = RenderSource("doc", b"unused")
+    view._page_infos = [info]
+    view.page_scene.set_pages([info])
+    old_key = TileKey("doc", 0, 1.0, 0, None, 0, "page")
+    new_key = TileKey("doc", 0, 1.5, 0, None, 0, "page")
+    old_render = RenderedPage(1, 1, 3, b"\xff\xff\xff", Rect(0, 0, 1, 1), 1.0)
+    new_render = RenderedPage(1, 1, 3, b"\xff\xff\xff", Rect(0, 0, 1, 1), 1.5)
+    view.page_scene.apply_render(old_key, old_render)
+    view._desired_keys = {new_key}
+
+    view.page_scene.retain_rasters(view._raster_retention_keys())
+    assert view.page_scene.pages[0].raster_keys == frozenset({old_key})
+
+    view._on_tile_ready(new_key, new_render)
+    assert view.page_scene.pages[0].raster_keys == frozenset({new_key})
     view.close()
     assert scheduler.shutdown()

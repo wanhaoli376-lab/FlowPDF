@@ -59,6 +59,7 @@ class PageGraphicsItem(QGraphicsRectItem):
             QImage.Format.Format_RGB888,
         ).copy()
         pixmap = QPixmap.fromImage(image)
+        self._remove_raster(key)
 
         if key.tile is None:
             for old_key in [item_key for item_key in self._rasters if item_key.tile is None]:
@@ -81,6 +82,12 @@ class PageGraphicsItem(QGraphicsRectItem):
     def clear_rasters(self) -> None:
         for key in tuple(self._rasters):
             self._remove_raster(key)
+
+    def retain_rasters(self, desired_keys: set[TileKey]) -> None:
+        """Drop decoded Qt pixmaps that are no longer useful to the viewport."""
+        for key in tuple(self._rasters):
+            if key not in desired_keys:
+                self._remove_raster(key)
 
     def set_search_hits(self, hits: list[SearchHit], current: SearchHit | None) -> None:
         for item in self._search_items:
@@ -174,6 +181,10 @@ class PageScene(QGraphicsScene):
     def clear_rasters(self) -> None:
         for page in self.pages:
             page.clear_rasters()
+
+    def retain_rasters(self, desired_keys: set[TileKey]) -> None:
+        for page in self.pages:
+            page.retain_rasters(desired_keys)
 
     def set_search_hits(self, hits: list[SearchHit], current_index: int | None) -> None:
         grouped: dict[int, list[SearchHit]] = defaultdict(list)

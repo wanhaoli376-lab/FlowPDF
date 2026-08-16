@@ -9,6 +9,15 @@ reordering and merge/split operations, text and image insertion, safe existing-t
 replacement, common annotations, permanent content deletion, unified undo/redo, recovery
 logs, and validated atomic saving to a protected copy.
 
+Queued obsolete renders are cancelled and results from already-running obsolete MuPDF calls
+are discarded; a native call already in progress cannot be force-interrupted. Snapshot undo
+has a 256 MiB retained-history budget and rejects or rolls back a mutation that cannot fit.
+Input is capped at 256 MiB and 250,000 PDF objects. Original PDFs above 64 MiB remain viewable
+but snapshot-backed edits are refused until the document is split.
+Encrypted undo snapshots and saved copies retain password protection. Page export requires the
+owner password and uses a validated temporary file plus atomic replacement, so a restricted
+user-password session cannot be upgraded through export.
+
 Object manipulation after insertion, visual signatures, freehand annotation, OCR, and full
 paragraph reflow are not implemented yet. See [README.zh-CN.md](README.zh-CN.md) for the exact
 completed/partial/not-implemented status; no unfinished feature is presented as complete.

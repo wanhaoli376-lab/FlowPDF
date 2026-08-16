@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from threading import get_ident
+from threading import Event, get_ident
 
 from PySide6.QtCore import QEventLoop, QThread, QTimer
 
@@ -43,3 +43,23 @@ def test_task_service_cancel_suppresses_callback(qapp) -> None:
     assert service.shutdown()
     qapp.processEvents()
     assert callbacks == []
+
+
+def test_task_service_shutdown_retries_until_worker_really_exits(qapp) -> None:
+    started = Event()
+    release = Event()
+    service = TaskService(max_threads=1)
+
+    def blocked(context):
+        started.set()
+        release.wait(2)
+        return 1
+
+    service.submit(blocked)
+    assert started.wait(1)
+    assert service.shutdown(timeout_ms=1) is False
+    assert service.active_count == 1
+
+    release.set()
+    assert service.shutdown(timeout_ms=2000) is True
+    assert service.active_count == 0

@@ -80,3 +80,22 @@ def test_obsolete_owner_task_is_cancelled_before_result_delivery(qapp) -> None:
     assert delivered == []
     assert scheduler.pending_count == 0
     assert scheduler.shutdown()
+
+
+def test_shutdown_can_be_retried_after_running_native_work_times_out(qapp) -> None:
+    started = Event()
+    release = Event()
+
+    def delayed_renderer(source, key, token):
+        started.set()
+        release.wait(2)
+        return RenderedPage(1, 1, 3, b"\xff\xff\xff", Rect(0, 0, 1, 1), key.scale)
+
+    scheduler = RenderScheduler(max_cache_bytes=1024, max_threads=1, renderer=delayed_renderer)
+    source = RenderSource("doc", b"unused")
+    scheduler.request(source, TileKey("doc", 0, 1.0, 0, None, 0), owner="view")
+    assert started.wait(1)
+
+    assert scheduler.shutdown(timeout_ms=1) is False
+    release.set()
+    assert scheduler.shutdown(timeout_ms=2000) is True

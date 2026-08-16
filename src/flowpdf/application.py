@@ -9,10 +9,13 @@ from PySide6.QtCore import QCoreApplication, QStandardPaths, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QIcon
 from PySide6.QtWidgets import QApplication, QInputDialog
 
+from flowpdf.backends.pymupdf_backend import PyMuPdfBackend
 from flowpdf.document_controller import DocumentController
 from flowpdf.rendering.render_scheduler import RenderScheduler
 from flowpdf.services.recent_files import RecentFiles
 from flowpdf.services.recovery_service import RecoveryService
+from flowpdf.services.save_artifact_registry import SaveArtifactRegistry
+from flowpdf.services.save_service import SafeSaveService
 from flowpdf.services.settings_service import SettingsService
 from flowpdf.services.temp_file_service import TempFileService
 from flowpdf.ui.main_window import MainWindow
@@ -45,6 +48,8 @@ def create_application(
     settings = SettingsService()
     root = _application_data_root(data_root)
     TempFileService(root / "temp").cleanup()
+    save_artifacts = SaveArtifactRegistry(root / "pending-saves.json")
+    save_artifacts.cleanup()
     scheduler = RenderScheduler(max_cache_bytes=settings.cache_limit_mb * 1024 * 1024)
     window = MainWindow(scheduler)
     window.setWindowIcon(icon)
@@ -52,6 +57,8 @@ def create_application(
         window,
         recovery_service=RecoveryService(root / "recovery"),
         recent_files=RecentFiles(settings.settings),
+        backend_factory=lambda: PyMuPdfBackend(artifact_registry=save_artifacts),
+        save_service=SafeSaveService(save_artifacts),
     )
     window.controller = controller
     window.theme_requested.connect(lambda value: _set_theme(app, window, settings, value))

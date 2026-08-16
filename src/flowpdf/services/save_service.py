@@ -9,6 +9,7 @@ from pathlib import Path
 from threading import Event
 
 from flowpdf.backends.base import PdfBackend, PdfError
+from flowpdf.services.save_artifact_registry import SaveArtifactRegistry
 
 
 class SafeSaveError(RuntimeError):
@@ -24,6 +25,9 @@ class SaveResult:
 
 class SafeSaveService:
     """Write, reopen, validate, and only then atomically replace the target."""
+
+    def __init__(self, artifact_registry: SaveArtifactRegistry | None = None) -> None:
+        self.artifact_registry = artifact_registry
 
     def save(
         self,
@@ -54,6 +58,8 @@ class SafeSaveService:
         self._check_cancel(cancel_event)
         self._report(progress, 5, "正在准备安全保存")
         try:
+            if self.artifact_registry is not None:
+                self.artifact_registry.register(temporary)
             backend.save_document(temporary)
             self._report(progress, 65, "正在重新打开并验证")
             self._check_cancel(cancel_event)
@@ -75,6 +81,9 @@ class SafeSaveService:
             if temporary.exists() and not temporary.is_symlink():
                 with suppress(OSError):
                     temporary.unlink()
+            if self.artifact_registry is not None and not temporary.exists():
+                with suppress(OSError, ValueError):
+                    self.artifact_registry.unregister(temporary)
 
         self._report(progress, 100, "保存完成")
         return SaveResult(target, validation.page_count, validation.file_size)

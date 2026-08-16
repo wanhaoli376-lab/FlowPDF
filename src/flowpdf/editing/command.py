@@ -30,3 +30,8 @@ class EditCommand(ABC):
     def merge_with(self, newer: EditCommand) -> bool:
         """Optionally absorb a newer high-frequency edit such as object movement."""
         return False
+
+    @property
+    def history_bytes(self) -> int:
+        """Approximate retained memory; non-snapshot commands cost no tracked bytes."""
+        return 0

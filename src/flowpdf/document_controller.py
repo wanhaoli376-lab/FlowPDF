@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -14,18 +15,19 @@ from flowpdf.backends.base import (
     InvalidPasswordError,
     PageInfo,
     PasswordRequiredError,
+    PdfBackend,
     SearchHit,
     TextEditability,
     TextSpan,
     TextStyle,
 )
-from flowpdf.backends.pymupdf_backend import PyMuPdfBackend
 from flowpdf.editing.document_session import DocumentSession
 from flowpdf.editing.pdf_commands import PdfCommandType
 from flowpdf.editing.tools import ToolMode
 from flowpdf.rendering.render_scheduler import RenderSource
 from flowpdf.services.recent_files import RecentFiles
 from flowpdf.services.recovery_service import RecoveryService
+from flowpdf.services.save_service import SafeSaveService
 from flowpdf.services.task_service import TaskContext, TaskHandle, TaskService
 from flowpdf.ui.dialogs.text_edit_dialog import TextEditDialog
 from flowpdf.utils.coordinates import Point, Rect
@@ -57,12 +59,16 @@ class DocumentController(QObject):
         *,
         recovery_service: RecoveryService,
         recent_files: RecentFiles,
+        backend_factory: Callable[[], PdfBackend],
+        save_service: SafeSaveService | None = None,
         task_service: TaskService | None = None,
     ) -> None:
         super().__init__(window)
         self.window = window
         self.recovery_service = recovery_service
         self.recent_files = recent_files
+        self.backend_factory = backend_factory
+        self.save_service = save_service or SafeSaveService()
         self.tasks = task_service or TaskService(max_threads=2, parent=self)
         self.session: DocumentSession | None = None
         self._search_hits: list[SearchHit] = []
@@ -112,8 +118,9 @@ class DocumentController(QObject):
         def load(context: TaskContext) -> LoadedSession:
             context.report_progress(5, "正在打开 PDF")
             session = DocumentSession(
-                PyMuPdfBackend(),
+                self.backend_factory(),
                 recovery_service=self.recovery_service,
+                save_service=self.save_service,
             )
             session.open(source, password=password)
             context.report_progress(35, "正在读取页面信息")
@@ -137,8 +144,9 @@ class DocumentController(QObject):
 
         def create(context: TaskContext) -> LoadedSession:
             session = DocumentSession(
-                PyMuPdfBackend(),
+                self.backend_factory(),
                 recovery_service=self.recovery_service,
+                save_service=self.save_service,
             )
             session.create_new()
             return LoadedSession(session, _snapshot(session, context))
@@ -189,8 +197,9 @@ class DocumentController(QObject):
 
         def recover(context: TaskContext) -> LoadedSession:
             session = DocumentSession(
-                PyMuPdfBackend(),
+                self.backend_factory(),
                 recovery_service=self.recovery_service,
+                save_service=self.save_service,
             )
             session.recover(recovery_path, password=password)
             return LoadedSession(session, _snapshot(session, context))
@@ -528,7 +537,9 @@ class DocumentController(QObject):
         if path is not None:
             self.recent_files.add(path)
             self.window.set_recent_files(self.recent_files.paths())
-        self.window.set_saved_status("原文件只读保护；首次保存将创建已修改副本")
+        self.window.set_saved_status(
+            "新建 PDF 尚未保存" if path is None else "原文件只读保护；首次保存将创建已修改副本"
+        )
         self._autosave.start()
         self._update_history_actions()
 
@@ -847,9 +858,9 @@ def _snapshot(session: DocumentSession, context: TaskContext) -> DocumentSnapsho
         if page_count > 10 and index % 10 == 0:
             context.report_progress(35 + round(35 * index / page_count), "正在读取页面尺寸")
     context.report_progress(75, "正在建立安全工作快照")
-    data = session.backend.document_bytes()
+    data, password = session.render_snapshot_data()
     return DocumentSnapshot(
-        RenderSource(session.document_id, data),
+        RenderSource(session.document_id, data, password),
         infos,
         session.revision,
         annotations,

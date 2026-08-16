@@ -5,7 +5,13 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from flowpdf.backends.base import AnnotationKind, AnnotationSpec, PdfBackend, TextStyle
+from flowpdf.backends.base import (
+    AnnotationKind,
+    AnnotationSpec,
+    PdfBackend,
+    PdfEditError,
+    TextStyle,
+)
 from flowpdf.editing.command import EditCommand
 from flowpdf.editing.text_editor import OverflowStrategy
 from flowpdf.utils.coordinates import Point, Rect
@@ -42,6 +48,10 @@ _DESCRIPTIONS = {
 }
 
 
+class PdfHistoryLimitError(PdfEditError):
+    """A mutation would retain unsafe amounts of undo snapshot memory."""
+
+
 class PdfMutationCommand(EditCommand):
     """Transactional PDF mutation with snapshot-backed undo and compact recovery data."""
 
@@ -54,6 +64,8 @@ class PdfMutationCommand(EditCommand):
         payload: dict[str, object],
         *,
         secrets: dict[str, object] | None = None,
+        max_history_bytes: int = 256 * 1024 * 1024,
+        source_size_bytes: int | None = None,
     ) -> None:
         self.backend = backend
         self.command_type = command_type
@@ -65,6 +77,8 @@ class PdfMutationCommand(EditCommand):
         self.payload = copied
         self._before: bytes | None = None
         self._after: bytes | None = None
+        self._max_history_bytes = max_history_bytes
+        self._source_size_bytes = source_size_bytes
 
     @property
     def description(self) -> str:
@@ -78,15 +92,43 @@ class PdfMutationCommand(EditCommand):
         if self._after is not None:
             self.backend.load_bytes(self._after)
             return
+        source_size = self._source_size_bytes
+        source_path = self.backend.source_path
+        if source_size is None and source_path is not None:
+            try:
+                source_size = source_path.stat().st_size
+            except OSError as exc:
+                raise PdfHistoryLimitError("无法核对源 PDF 的编辑内存预算") from exc
+        if source_size is not None and source_size > self._max_history_bytes // 4:
+            raise PdfHistoryLimitError("源 PDF 超过安全编辑快照上限；仍可查看，请拆分后再编辑")
         before = self.backend.document_bytes()
+        if len(before) * 2 > self._max_history_bytes:
+            raise PdfHistoryLimitError("文档过大，当前撤销内存预算不足，未执行本次修改")
+        estimated_growth = self._external_payload_bytes()
+        if len(before) * 2 + estimated_growth > self._max_history_bytes:
+            raise PdfHistoryLimitError("待插入文件会超过撤销内存预算，未执行本次修改")
         try:
             self._dispatch()
             after = self.backend.document_bytes()
+            if len(before) + len(after) > self._max_history_bytes:
+                raise PdfHistoryLimitError("本次修改会超过撤销内存预算，已恢复修改前状态")
         except Exception:
             self.backend.load_bytes(before)
             raise
         self._before = before
         self._after = after
+
+    def _external_payload_bytes(self) -> int:
+        if self.command_type is PdfCommandType.INSERT_PDF:
+            key = "source_path"
+        elif self.command_type is PdfCommandType.ADD_IMAGE:
+            key = "image_path"
+        else:
+            return 0
+        try:
+            return Path(str(self.payload[key])).stat().st_size
+        except (KeyError, OSError):
+            return 0
 
     def undo(self) -> None:
         if self._before is None:
@@ -111,13 +153,22 @@ class PdfMutationCommand(EditCommand):
         record: dict[str, object],
         *,
         secrets: dict[str, object] | None = None,
+        max_history_bytes: int = 256 * 1024 * 1024,
+        source_size_bytes: int | None = None,
     ) -> PdfMutationCommand:
         data = dict(record)
         try:
             command_type = PdfCommandType(str(data.pop("type")))
         except (KeyError, ValueError) as exc:
             raise ValueError("恢复记录中的命令类型无效") from exc
-        return cls(backend, command_type, data, secrets=secrets)
+        return cls(
+            backend,
+            command_type,
+            data,
+            secrets=secrets,
+            max_history_bytes=max_history_bytes,
+            source_size_bytes=source_size_bytes,
+        )
 
     def _dispatch(self) -> None:
         payload = self.payload

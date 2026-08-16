@@ -12,6 +12,7 @@ texts.
 | PyMuPDF 1.28.2 | AGPLv3/commercial | PDF engine | AGPL obligations can apply to the complete distributed application; obtain commercial terms if AGPL is unsuitable. |
 | Pillow 12.2.0 | HPND | Image import and icon generation | Include its license. |
 | PyInstaller 6.22.1 | GPLv2 with bootloader exception | Packaging | The bootloader exception permits bundled output subject to its terms; include notices. |
+| setuptools 84.0.0 | MIT | Build dependency | Not bundled as an application feature; retain build-environment notice. |
 | pytest 9.1.1 | MIT | Development only | Not bundled in the intended release directory. |
 | ruff 0.16.2 | MIT | Development only | Not bundled. |
 

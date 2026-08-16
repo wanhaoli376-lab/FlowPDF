@@ -107,6 +107,7 @@ class TaskService(QObject):
         self._pool.setMaxThreadCount(max_threads)
         self._active: dict[str, _ActiveTask] = {}
         self._closed = False
+        self._shutdown_complete = False
 
     @property
     def active_count(self) -> int:
@@ -140,14 +141,16 @@ class TaskService(QObject):
             active.handle.cancel()
 
     def shutdown(self, timeout_ms: int = 5000) -> bool:
-        if self._closed:
+        if self._shutdown_complete:
             return True
         self._closed = True
         self.cancel_all()
         self._pool.clear()
         finished = self._pool.waitForDone(timeout_ms)
-        self._active.clear()
-        self.busy_changed.emit(False)
+        if finished:
+            self._active.clear()
+            self.busy_changed.emit(False)
+            self._shutdown_complete = True
         return finished
 
     @Slot(str, object, object, object)

@@ -28,9 +28,12 @@ _disable_windows_native_error_dialogs()
 @pytest.fixture(scope="session")
 def qapp():
     """Keep one QApplication wrapper alive until every Qt test has torn down."""
-    from PySide6.QtCore import QCoreApplication, QEvent
+    from PySide6.QtCore import QCoreApplication, QEvent, QSettings
     from PySide6.QtWidgets import QApplication
 
+    settings_root = str(Path(os.environ["FLOWPDF_DATA_DIR"]) / "settings")
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, settings_root)
     application = QApplication.instance() or QApplication(["flowpdf-tests"])
     yield application
     application.closeAllWindows()

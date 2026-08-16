@@ -39,6 +39,7 @@ class ThumbnailPanel(QListWidget):
         self._infos: list[PageInfo] = []
         self._revision = 0
         self._owner = f"thumbnail-panel-{id(self)}"
+        self._desired_keys: set[TileKey] = set()
         self._schedule_timer = QTimer(self)
         self._schedule_timer.setSingleShot(True)
         self._schedule_timer.setInterval(40)
@@ -68,6 +69,7 @@ class ThumbnailPanel(QListWidget):
         revision: int = 0,
     ) -> None:
         self.scheduler.cancel_owner_obsolete(self._owner, set())
+        self._desired_keys.clear()
         self._source = source
         self._infos = list(infos)
         self._revision = revision
@@ -85,6 +87,7 @@ class ThumbnailPanel(QListWidget):
 
     def clear_document(self) -> None:
         self.scheduler.cancel_owner_obsolete(self._owner, set())
+        self._desired_keys.clear()
         self._source = None
         self._infos.clear()
         self.clear()
@@ -178,6 +181,11 @@ class ThumbnailPanel(QListWidget):
                 owner=self._owner,
                 priority=RenderPriority.THUMBNAIL,
             )
+        self._desired_keys = desired
+        desired_pages = {key.page_index for key in desired}
+        for index in range(self.count()):
+            if index not in desired_pages:
+                self.item(index).setIcon(QIcon())
         self.scheduler.cancel_owner_obsolete(self._owner, desired)
 
     def _on_tile_ready(self, key: TileKey, rendered) -> None:
@@ -187,6 +195,7 @@ class ThumbnailPanel(QListWidget):
             or key.revision != self._revision
             or key.purpose != "thumbnail"
             or not 0 <= key.page_index < self.count()
+            or key not in self._desired_keys
         ):
             return
         image = QImage(

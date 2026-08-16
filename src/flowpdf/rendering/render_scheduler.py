@@ -114,6 +114,7 @@ class RenderScheduler(QObject):
         self._inflight: dict[CancellationToken, _RenderTask] = {}
         self._lock = RLock()
         self._closed = False
+        self._shutdown_complete = False
 
     @property
     def pending_count(self) -> int:
@@ -188,7 +189,7 @@ class RenderScheduler(QObject):
         self._cache.resize(max_bytes)
 
     def shutdown(self, timeout_ms: int = 5000) -> bool:
-        if self._closed:
+        if self._shutdown_complete:
             return True
         self._closed = True
         self.cancel_all()
@@ -196,6 +197,7 @@ class RenderScheduler(QObject):
         if finished:
             with self._lock:
                 self._inflight.clear()
+            self._shutdown_complete = True
         return finished
 
     @Slot(object, object, object, object)

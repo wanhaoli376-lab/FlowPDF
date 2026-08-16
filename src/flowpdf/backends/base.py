@@ -45,8 +45,9 @@ class PdfSaveError(PdfError):
 
 @dataclass(frozen=True, slots=True)
 class PdfResourceLimits:
-    max_source_bytes: int = 1_000_000_000
+    max_source_bytes: int = 256 * 1024 * 1024
     max_pages: int = 5_000
+    max_xref_objects: int = 250_000
     max_page_dimension: float = 20_000.0
     max_render_pixels: int = 80_000_000
     max_image_bytes: int = 200_000_000
