@@ -30,6 +30,7 @@ $distribution = Join-Path $projectRoot "dist\FlowPDF"
 Copy-Item -LiteralPath (Join-Path $projectRoot "README.md") -Destination $distribution
 Copy-Item -LiteralPath (Join-Path $projectRoot "README.zh-CN.md") -Destination $distribution
 Copy-Item -LiteralPath (Join-Path $projectRoot "BUILD_REPORT.md") -Destination $distribution
+Copy-Item -LiteralPath (Join-Path $projectRoot "MANUAL_DOCUMENT_MODE_TEST.md") -Destination $distribution
 Copy-Item -LiteralPath (Join-Path $projectRoot "LICENSES") -Destination $distribution -Recurse
 
 Write-Host "构建完成：$projectRoot\dist\FlowPDF\FlowPDF.exe"

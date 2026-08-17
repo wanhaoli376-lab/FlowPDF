@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pymupdf
 from PySide6.QtGui import QTextCursor
+from PySide6.QtWidgets import QMessageBox
 
 from flowpdf.application import create_application
 
@@ -155,3 +156,32 @@ def test_document_controller_checkpoints_dirty_model_and_clears_after_project_sa
     assert controller.recovery_service.list_sessions() == []
 
     window.close()
+
+
+def test_document_to_layout_switch_exports_validated_snapshot_and_cleans_it_on_exit(
+    qapp, tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "切换来源.pdf"
+    _single_column_pdf(source)
+    data_root = tmp_path / "app-data"
+    _app, window = create_application(["flowpdf-test"], data_root=data_root)
+    controller = window.document_mode_controller
+    controller.import_pdf(source)
+    assert _wait_until(qapp, lambda: controller.document is not None)
+    window.document_editor_view.editor.insertPlainText("切换前的修改")
+    monkeypatch.setattr(
+        "flowpdf.mode_coordinator.QMessageBox.warning",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    window.lifecycle_controller.switch_to_layout_mode()
+    assert _wait_until(qapp, lambda: window.controller.session is not None)
+    assert window.active_mode == "layout"
+    assert controller.document is None
+    snapshots = list((data_root / "temp").glob("flowpdf-*.pdf"))
+    assert len(snapshots) == 1
+    verify = pymupdf.open(snapshots[0])
+    verify.close()
+
+    window.close()
+    assert not snapshots[0].exists()

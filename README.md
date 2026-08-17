@@ -4,10 +4,11 @@ FlowPDF is a local-first PDF viewer and editing MVP for Windows 10/11. The defau
 Simplified Chinese. Files stay on the computer: there is no upload, account, telemetry, or
 advertising.
 
-The tested MVP includes asynchronous virtualized/tiled viewing, thumbnails, search, page
-reordering and merge/split operations, text and image insertion, safe existing-text
-replacement, common annotations, permanent content deletion, unified undo/redo, recovery
-logs, and validated atomic saving to a protected copy.
+The tested MVP now has two independent editing models. Layout mode retains asynchronous
+virtualized/tiled viewing, page operations, fixed-position edits, annotations and protected
+atomic saving. Document mode reconstructs suitable single-column PDFs into a serializable
+`FlowDocument`, edits the result in one continuous `QTextDocument`, automatically reflows and
+paginates content, saves `.flowpdfproj` projects, and exports newly laid-out searchable PDFs.
 
 Queued obsolete renders are cancelled and results from already-running obsolete MuPDF calls
 are discarded; a native call already in progress cannot be force-interrupted. Snapshot undo
@@ -18,9 +19,10 @@ Encrypted undo snapshots and saved copies retain password protection. Page expor
 owner password and uses a validated temporary file plus atomic replacement, so a restricted
 user-password session cannot be upgraded through export.
 
-Object manipulation after insertion, visual signatures, freehand annotation, OCR, and full
-paragraph reflow are not implemented yet. See [README.zh-CN.md](README.zh-CN.md) for the exact
-completed/partial/not-implemented status; no unfinished feature is presented as complete.
+Reliable multi-column/table/formula reconstruction, polished Word-style physical page gaps,
+floating image wrapping, visual signatures, freehand annotation, and OCR are not implemented.
+See [README.zh-CN.md](README.zh-CN.md) for the exact completed/partial/not-implemented status;
+no unfinished feature is presented as complete.
 
 ## Start from a clean environment
 

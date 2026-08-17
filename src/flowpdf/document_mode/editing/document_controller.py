@@ -450,7 +450,9 @@ class DocumentModeController(QObject):
         if self.is_shutdown:
             return True
         self._autosave.stop()
-        finished = self.tasks.shutdown() and self.recovery_tasks.shutdown()
+        tasks_finished = self.tasks.shutdown()
+        recovery_finished = self.recovery_tasks.shutdown()
+        finished = tasks_finished and recovery_finished
         self.is_shutdown = finished
         return finished
 
