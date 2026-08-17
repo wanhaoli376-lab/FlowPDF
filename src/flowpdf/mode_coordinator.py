@@ -49,6 +49,9 @@ class ModeCoordinator(QObject):
         if selected:
             self.open_path(selected)
 
+    def offer_recovery(self) -> None:
+        self.document_controller.offer_recovery(on_none=self.layout_controller.offer_recovery)
+
     def open_project_dialog(self) -> None:
         selected, _filter = QFileDialog.getOpenFileName(
             self.window,

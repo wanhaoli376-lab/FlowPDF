@@ -5,7 +5,13 @@ from dataclasses import asdict
 from typing import Any
 
 from flowpdf.document_mode.models.assets import ImageAsset
-from flowpdf.document_mode.models.blocks import BlockImage, Paragraph, SemanticRole, TextRun
+from flowpdf.document_mode.models.blocks import (
+    BlockImage,
+    PageBreak,
+    Paragraph,
+    SemanticRole,
+    TextRun,
+)
 from flowpdf.document_mode.models.document import (
     DocumentMetadata,
     FlowDocument,
@@ -101,7 +107,7 @@ class DocumentSerializer:
         return document
 
     @classmethod
-    def _block_to_dict(cls, block: Paragraph | BlockImage) -> dict[str, Any]:
+    def _block_to_dict(cls, block: Paragraph | BlockImage | PageBreak) -> dict[str, Any]:
         if isinstance(block, Paragraph):
             return {
                 "type": "paragraph",
@@ -128,10 +134,12 @@ class DocumentSerializer:
                 "alt_text": block.alt_text,
                 "source_ref": cls._source_to_dict(block.source_ref),
             }
+        if isinstance(block, PageBreak):
+            return {"type": "page_break"}
         raise DocumentFormatError(f"暂不支持序列化块类型：{type(block).__name__}")
 
     @classmethod
-    def _block_from_dict(cls, value: dict[str, Any]) -> Paragraph | BlockImage:
+    def _block_from_dict(cls, value: dict[str, Any]) -> Paragraph | BlockImage | PageBreak:
         if value.get("type") == "paragraph":
             return cls._paragraph_from_dict(value)
         if value.get("type") == "image":
@@ -144,6 +152,8 @@ class DocumentSerializer:
                 alt_text=str(value.get("alt_text", "")),
                 source_ref=cls._source_from_dict(value.get("source_ref")),
             )
+        if value.get("type") == "page_break":
+            return PageBreak()
         raise DocumentFormatError("文档包含不受支持的块类型")
 
     @classmethod

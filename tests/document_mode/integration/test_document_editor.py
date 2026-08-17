@@ -7,7 +7,14 @@ from PySide6.QtCore import QMimeData, QRect, QRectF, Qt
 from PySide6.QtGui import QInputMethodEvent, QTextCursor
 
 from flowpdf.document_mode.editing import PaginatedTextEdit
-from flowpdf.document_mode.models import BlockImage, FlowDocument, PageSetup, Paragraph, TextRun
+from flowpdf.document_mode.models import (
+    BlockImage,
+    FlowDocument,
+    PageBreak,
+    PageSetup,
+    Paragraph,
+    TextRun,
+)
 
 
 def _reflow_document() -> FlowDocument:
@@ -234,4 +241,20 @@ def test_editor_selects_copies_deletes_undoes_and_redoes_across_pages(qapp) -> N
     assert selected.replace("\u2029", "\n") in editor.toPlainText()
     editor.redo()
     assert selected not in editor.toPlainText()
+    editor.close()
+
+
+def test_editor_page_break_survives_model_mapping_and_forces_new_page(qapp) -> None:
+    document = FlowDocument.new()
+    document.append_block(Paragraph(runs=[TextRun("第一页内容")]))
+    editor = PaginatedTextEdit()
+    editor.set_flow_document(document)
+    editor.moveCursor(QTextCursor.MoveOperation.End)
+
+    editor.insert_page_break()
+    editor.insertPlainText("第二页内容")
+    restored = editor.flow_document()
+
+    assert any(isinstance(block, PageBreak) for block in restored.sections[0].blocks)
+    assert editor.page_count >= 2
     editor.close()

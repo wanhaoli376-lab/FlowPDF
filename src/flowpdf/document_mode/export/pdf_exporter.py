@@ -16,7 +16,7 @@ from flowpdf.document_mode.export.export_validator import (
     ExportValidator,
     PdfExportValidationError,
 )
-from flowpdf.document_mode.models import BlockImage, FlowDocument, Paragraph
+from flowpdf.document_mode.models import BlockImage, FlowDocument, PageBreak, Paragraph
 
 
 class PdfExportError(RuntimeError):
@@ -79,6 +79,7 @@ class DocumentPdfExporter:
         try:
             if self._artifact_registry is not None:
                 self._artifact_registry.register(temporary)
+                self._artifact_registry.register(story_temporary)
             report(5, "正在准备文档布局")
             self._raise_if_cancelled(cancel)
             layout = self._write_pdf(
@@ -120,9 +121,11 @@ class DocumentPdfExporter:
             if story_temporary.exists() and not story_temporary.is_symlink():
                 with suppress(OSError):
                     story_temporary.unlink()
-            if self._artifact_registry is not None and not temporary.exists():
-                with suppress(OSError, ValueError):
-                    self._artifact_registry.unregister(temporary)
+            if self._artifact_registry is not None:
+                for artifact in (temporary, story_temporary):
+                    if not artifact.exists():
+                        with suppress(OSError, ValueError):
+                            self._artifact_registry.unregister(artifact)
 
     @staticmethod
     @serialized_pymupdf
@@ -279,6 +282,9 @@ def _document_html(document: FlowDocument) -> str:
             if active_list is not None:
                 parts.append(f"</{active_list}>")
                 active_list = None
+            if isinstance(block, PageBreak):
+                parts.append('<div style="page-break-before:always"></div>')
+                continue
             if isinstance(block, Paragraph):
                 parts.append(
                     f'<p class="{block.semantic_role.value}" '

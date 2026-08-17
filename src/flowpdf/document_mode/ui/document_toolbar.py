@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QFont, QTextCharFormat
-from PySide6.QtWidgets import QComboBox, QDoubleSpinBox, QFontComboBox, QLabel, QToolBar
+from PySide6.QtWidgets import (
+    QColorDialog,
+    QComboBox,
+    QDoubleSpinBox,
+    QFontComboBox,
+    QLabel,
+    QToolBar,
+)
 
 from flowpdf.document_mode.editing import PaginatedTextEdit
 
@@ -13,6 +20,7 @@ class DocumentToolbar(QToolBar):
     insert_image_requested = Signal()
     export_pdf_requested = Signal()
     find_replace_requested = Signal()
+    page_setup_requested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__("文档编辑工具", parent)
@@ -36,6 +44,10 @@ class DocumentToolbar(QToolBar):
         self.italic_action = self._format_action("斜体", "Ctrl+I", checkable=True)
         self.underline_action = self._format_action("下划线", "Ctrl+U", checkable=True)
         self.strikeout_action = self._format_action("删除线", checkable=True)
+        self.text_color_action = self._format_action("文字颜色")
+        self.background_color_action = self._format_action("背景色")
+        self.superscript_action = self._format_action("上标", checkable=True)
+        self.subscript_action = self._format_action("下标", checkable=True)
         self.clear_format_action = self._format_action("清除格式")
         self.addSeparator()
 
@@ -55,15 +67,20 @@ class DocumentToolbar(QToolBar):
         self.addWidget(self.line_spacing)
         self.bullet_action = self._format_action("项目符号", checkable=True)
         self.number_action = self._format_action("编号", checkable=True)
+        self.first_line_indent_action = self._format_action("首行缩进", checkable=True)
+        self.decrease_indent_action = self._format_action("减少缩进")
+        self.increase_indent_action = self._format_action("增加缩进")
         self.addSeparator()
 
         self.insert_image_action = self._format_action("插入图片")
         self.page_break_action = self._format_action("分页符")
+        self.page_setup_action = self._format_action("页面设置")
         self.find_replace_action = self._format_action("查找替换", "Ctrl+H")
         self.export_pdf_action = self._format_action("导出 PDF")
 
         self.insert_image_action.triggered.connect(self.insert_image_requested)
         self.find_replace_action.triggered.connect(self.find_replace_requested)
+        self.page_setup_action.triggered.connect(self.page_setup_requested)
         self.export_pdf_action.triggered.connect(self.export_pdf_requested)
 
     def bind(self, editor: PaginatedTextEdit) -> None:
@@ -78,6 +95,10 @@ class DocumentToolbar(QToolBar):
         self.italic_action.triggered.connect(editor.set_italic)
         self.underline_action.triggered.connect(editor.set_underline)
         self.strikeout_action.triggered.connect(editor.set_strikeout)
+        self.text_color_action.triggered.connect(self._choose_text_color)
+        self.background_color_action.triggered.connect(self._choose_background_color)
+        self.superscript_action.triggered.connect(self._set_superscript)
+        self.subscript_action.triggered.connect(self._set_subscript)
         self.clear_format_action.triggered.connect(editor.clear_character_format)
         self.left_action.triggered.connect(
             lambda _checked=False: editor.set_paragraph_alignment("left")
@@ -99,6 +120,15 @@ class DocumentToolbar(QToolBar):
         )
         self.number_action.triggered.connect(
             lambda checked: editor.set_list_style("number" if checked else None)
+        )
+        self.first_line_indent_action.triggered.connect(
+            lambda checked: editor.set_paragraph_indents(first_line_pt=24 if checked else 0)
+        )
+        self.decrease_indent_action.triggered.connect(
+            lambda _checked=False: editor.change_paragraph_indent(-18)
+        )
+        self.increase_indent_action.triggered.connect(
+            lambda _checked=False: editor.change_paragraph_indent(18)
         )
         self.page_break_action.triggered.connect(editor.insert_page_break)
         editor.currentCharFormatChanged.connect(self._sync_character_format)
@@ -143,6 +173,13 @@ class DocumentToolbar(QToolBar):
         self.italic_action.setChecked(value.fontItalic())
         self.underline_action.setChecked(value.fontUnderline())
         self.strikeout_action.setChecked(value.fontStrikeOut())
+        vertical = value.verticalAlignment()
+        self.superscript_action.setChecked(
+            vertical == QTextCharFormat.VerticalAlignment.AlignSuperScript
+        )
+        self.subscript_action.setChecked(
+            vertical == QTextCharFormat.VerticalAlignment.AlignSubScript
+        )
 
     def _sync_from_editor(self) -> None:
         if self._editor is None:
@@ -163,3 +200,33 @@ class DocumentToolbar(QToolBar):
         else:
             action = self.left_action
         action.setChecked(True)
+
+    def _choose_text_color(self) -> None:
+        if self._editor is None:
+            return
+        color = QColorDialog.getColor(parent=self)
+        if color.isValid():
+            self._editor.set_text_color(color)
+
+    def _choose_background_color(self) -> None:
+        if self._editor is None:
+            return
+        color = QColorDialog.getColor(parent=self)
+        if color.isValid():
+            self._editor.set_background_color(color)
+
+    def _set_superscript(self, checked: bool) -> None:
+        if self._editor is None:
+            return
+        if checked:
+            self.subscript_action.setChecked(False)
+            self._editor.set_subscript(False)
+        self._editor.set_superscript(checked)
+
+    def _set_subscript(self, checked: bool) -> None:
+        if self._editor is None:
+            return
+        if checked:
+            self.superscript_action.setChecked(False)
+            self._editor.set_superscript(False)
+        self._editor.set_subscript(checked)

@@ -23,6 +23,7 @@ from flowpdf.document_mode.models import (
     BlockImage,
     FlowDocument,
     ImageAsset,
+    PageBreak,
     PageSetup,
     Paragraph,
     ParagraphAlignment,
@@ -37,6 +38,7 @@ from flowpdf.document_mode.models import (
 _ROLE_PROPERTY = int(QTextFormat.Property.UserProperty) + 101
 _SOURCE_PROPERTY = int(QTextFormat.Property.UserProperty) + 102
 _IMAGE_ALT_PROPERTY = int(QTextFormat.Property.UserProperty) + 103
+_PAGE_BREAK_PROPERTY = int(QTextFormat.Property.UserProperty) + 104
 _ASSET_SCHEME = "flowpdf-asset"
 
 
@@ -63,6 +65,8 @@ class DocumentMapper:
                 first = False
                 if isinstance(block, Paragraph):
                     self._insert_paragraph(cursor, block, geometry)
+                elif isinstance(block, PageBreak):
+                    self._insert_page_break(cursor)
                 else:
                     self._insert_image(cursor, block, geometry)
         if first:
@@ -73,9 +77,13 @@ class DocumentMapper:
 
     def to_model(self, source: QTextDocument) -> FlowDocument:
         document = copy.deepcopy(self._template)
-        blocks: list[Paragraph | BlockImage] = []
+        blocks: list[Paragraph | BlockImage | PageBreak] = []
         block = source.begin()
         while block.isValid():
+            if block.blockFormat().boolProperty(_PAGE_BREAK_PROPERTY):
+                blocks.append(PageBreak())
+                block = block.next()
+                continue
             image = self._block_image(block)
             blocks.append(image if image is not None else self._paragraph(block))
             block = block.next()
@@ -140,6 +148,13 @@ class DocumentMapper:
                 _SOURCE_PROPERTY,
                 json.dumps(asdict(paragraph.source_ref), ensure_ascii=False),
             )
+        cursor.setBlockFormat(block_format)
+
+    @staticmethod
+    def _insert_page_break(cursor: QTextCursor) -> None:
+        block_format = QTextBlockFormat()
+        block_format.setProperty(_PAGE_BREAK_PROPERTY, True)
+        block_format.setPageBreakPolicy(QTextFormat.PageBreakFlag.PageBreak_AlwaysBefore)
         cursor.setBlockFormat(block_format)
 
     @staticmethod
@@ -226,12 +241,12 @@ def _char_format(style: TextStyle) -> QTextCharFormat:
 
 
 def _text_style(value: QTextCharFormat) -> TextStyle:
-    families = value.fontFamilies()
+    family = value.font().family()
     vertical = value.verticalAlignment()
     background = value.background().color()
     has_background = value.background().style() is not Qt.BrushStyle.NoBrush
     return TextStyle(
-        font_family=families[0] if families else value.fontFamily() or "Microsoft YaHei",
+        font_family=family or "Microsoft YaHei",
         font_size_pt=value.fontPointSize() if value.fontPointSize() > 0 else 11.0,
         bold=value.fontWeight() >= QFont.Weight.Bold,
         italic=value.fontItalic(),

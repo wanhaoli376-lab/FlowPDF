@@ -1,5 +1,11 @@
 from flowpdf.document_mode.models.assets import ImageAsset
-from flowpdf.document_mode.models.blocks import BlockImage, Paragraph, SemanticRole, TextRun
+from flowpdf.document_mode.models.blocks import (
+    BlockImage,
+    PageBreak,
+    Paragraph,
+    SemanticRole,
+    TextRun,
+)
 from flowpdf.document_mode.models.document import (
     DocumentMetadata,
     FlowDocument,
@@ -21,6 +27,7 @@ __all__ = [
     "DocumentSerializer",
     "FlowDocument",
     "ImageAsset",
+    "PageBreak",
     "PageSetup",
     "Paragraph",
     "ParagraphAlignment",

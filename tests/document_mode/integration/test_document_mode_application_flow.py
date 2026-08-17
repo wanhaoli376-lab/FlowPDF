@@ -128,3 +128,30 @@ def test_mode_coordinator_can_keep_original_layout_after_analysis(qapp, tmp_path
     assert not window.document_toolbar.isVisibleTo(window)
 
     window.close()
+
+
+def test_document_controller_checkpoints_dirty_model_and_clears_after_project_save(
+    qapp, tmp_path
+) -> None:
+    source = tmp_path / "恢复来源.pdf"
+    project = tmp_path / "恢复工程.flowpdfproj"
+    _single_column_pdf(source)
+    _app, window = create_application(["flowpdf-test"], data_root=tmp_path / "app-data")
+    controller = window.document_mode_controller
+    controller.import_pdf(source)
+    assert _wait_until(qapp, lambda: controller.document is not None)
+    editor = window.document_editor_view.editor
+    editor.moveCursor(QTextCursor.MoveOperation.End)
+    editor.insertPlainText("需要恢复的中文修改")
+
+    controller.flush_recovery()
+    assert _wait_until(qapp, lambda: controller.recovery_tasks.active_count == 0)
+    records = controller.recovery_service.list_sessions()
+    assert len(records) == 1
+    assert "需要恢复的中文修改" in records[0].document.plain_text
+
+    controller.save_project_to(project)
+    assert _wait_until(qapp, lambda: project.exists() and controller.tasks.active_count == 0)
+    assert controller.recovery_service.list_sessions() == []
+
+    window.close()

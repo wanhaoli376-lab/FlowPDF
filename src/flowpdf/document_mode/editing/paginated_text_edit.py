@@ -230,6 +230,11 @@ class PaginatedTextEdit(QTextEdit):
             value.setBottomMargin(self._geometry.points_to_pixels(after_pt))
         self.textCursor().mergeBlockFormat(value)
 
+    def change_paragraph_indent(self, delta_pt: float) -> None:
+        current_px = self.textCursor().blockFormat().leftMargin()
+        current_pt = self._geometry.pixels_to_points(current_px)
+        self.set_paragraph_indents(left_pt=max(0.0, current_pt + delta_pt))
+
     def set_keep_together(self, enabled: bool) -> None:
         value = QTextBlockFormat()
         value.setNonBreakableLines(enabled)
@@ -260,7 +265,10 @@ class PaginatedTextEdit(QTextEdit):
         cursor.insertBlock()
         value = cursor.blockFormat()
         value.setPageBreakPolicy(QTextFormat.PageBreakFlag.PageBreak_AlwaysBefore)
+        value.setProperty(int(QTextFormat.Property.UserProperty) + 104, True)
         cursor.setBlockFormat(value)
+        cursor.insertBlock()
+        self.setTextCursor(cursor)
 
     def insert_image(
         self,
@@ -270,17 +278,23 @@ class PaginatedTextEdit(QTextEdit):
         width_pt: float | None = None,
         alignment: str = "center",
         alt_text: str = "",
+        pixel_size: tuple[int, int] | None = None,
     ) -> str:
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", Image.DecompressionBombWarning)
-                with Image.open(io.BytesIO(data)) as decoded:
-                    width_px, height_px = decoded.size
-                    decoded.verify()
-        except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
-            raise ValueError("图片解码资源异常") from exc
-        except (OSError, UnidentifiedImageError) as exc:
-            raise ValueError("图片内容损坏或格式不受支持") from exc
+        if pixel_size is None:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", Image.DecompressionBombWarning)
+                    with Image.open(io.BytesIO(data)) as decoded:
+                        width_px, height_px = decoded.size
+                        decoded.verify()
+            except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+                raise ValueError("图片解码资源异常") from exc
+            except (OSError, UnidentifiedImageError) as exc:
+                raise ValueError("图片内容损坏或格式不受支持") from exc
+        else:
+            width_px, height_px = pixel_size
+            if width_px <= 0 or height_px <= 0:
+                raise ValueError("图片尺寸无效")
         if width_px * height_px > 80_000_000:
             raise ValueError("图片像素数量超过安全上限")
         asset = ImageAsset.create(

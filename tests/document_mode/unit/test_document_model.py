@@ -11,6 +11,7 @@ from flowpdf.document_mode.models import (
     DocumentSerializer,
     FlowDocument,
     ImageAsset,
+    PageBreak,
     Paragraph,
     SemanticRole,
     SourceReference,
@@ -45,6 +46,18 @@ def test_flow_document_normalizes_runs_and_round_trips_chinese_json() -> None:
     assert paragraph.text == "你好，FlowPDF"
     assert paragraph.runs == [TextRun("你好，FlowPDF", style, source)]
     assert restored == document
+
+
+def test_flow_document_serializes_structural_page_break() -> None:
+    document = FlowDocument.new()
+    document.append_block(Paragraph(runs=[TextRun("分页前")]))
+    document.append_block(PageBreak())
+    document.append_block(Paragraph(runs=[TextRun("分页后")]))
+
+    restored = DocumentSerializer.loads(DocumentSerializer.dumps(document))
+
+    assert isinstance(restored.sections[0].blocks[1], PageBreak)
+    assert restored.plain_text == "分页前\n分页后"
 
 
 def test_project_round_trip_preserves_document_image_and_view_state(tmp_path) -> None:

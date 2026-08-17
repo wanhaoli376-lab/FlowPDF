@@ -71,4 +71,9 @@ class BlockImage:
             raise ValueError("图片对齐方式无效")
 
 
-Block = Paragraph | BlockImage
+@dataclass(frozen=True, slots=True)
+class PageBreak:
+    """A user-authored hard page break in the reflowable document."""
+
+
+Block = Paragraph | BlockImage | PageBreak

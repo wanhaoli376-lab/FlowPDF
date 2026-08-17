@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication, QInputDialog
 from flowpdf.backends.pymupdf_backend import PyMuPdfBackend
 from flowpdf.document_controller import DocumentController
 from flowpdf.document_mode.editing.document_controller import DocumentModeController
+from flowpdf.document_mode.recovery_service import DocumentRecoveryService
 from flowpdf.mode_coordinator import ModeCoordinator
 from flowpdf.rendering.render_scheduler import RenderScheduler
 from flowpdf.services.recent_files import RecentFiles
@@ -68,6 +69,7 @@ def create_application(
     document_mode_controller = DocumentModeController(
         window,
         artifact_registry=save_artifacts,
+        recovery_service=DocumentRecoveryService(root / "document-recovery"),
     )
     window.attach_document_mode_controller(document_mode_controller)
     mode_coordinator = ModeCoordinator(

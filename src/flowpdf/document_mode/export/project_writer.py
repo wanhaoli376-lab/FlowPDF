@@ -7,13 +7,23 @@ import zipfile
 from contextlib import suppress
 from dataclasses import asdict
 from pathlib import Path
+from typing import Protocol
 
 from flowpdf.document_mode.export.project_format import ProjectError, ProjectManifest, ProjectState
 from flowpdf.document_mode.export.project_reader import ProjectReader
 from flowpdf.document_mode.models import DocumentSerializer, FlowDocument
 
 
+class ArtifactRegistry(Protocol):
+    def register(self, artifact: str | Path) -> None: ...
+
+    def unregister(self, artifact: str | Path) -> None: ...
+
+
 class ProjectWriter:
+    def __init__(self, *, artifact_registry: ArtifactRegistry | None = None) -> None:
+        self._artifact_registry = artifact_registry
+
     def save(
         self,
         document: FlowDocument,
@@ -36,6 +46,8 @@ class ProjectWriter:
         )
         temporary = target.parent / f".flowpdf-project-{uuid.uuid4().hex}.tmp"
         try:
+            if self._artifact_registry is not None:
+                self._artifact_registry.register(temporary)
             with zipfile.ZipFile(
                 temporary,
                 "x",
@@ -64,4 +76,7 @@ class ProjectWriter:
             if temporary.exists() and not temporary.is_symlink():
                 with suppress(OSError):
                     temporary.unlink()
+            if self._artifact_registry is not None and not temporary.exists():
+                with suppress(OSError, ValueError):
+                    self._artifact_registry.unregister(temporary)
         return target

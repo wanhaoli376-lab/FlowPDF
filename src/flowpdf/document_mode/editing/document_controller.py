@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import io
+import uuid
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from PIL import Image, UnidentifiedImageError
 from PySide6.QtCore import QObject, QTimer
-from PySide6.QtWidgets import QFileDialog, QMessageBox
+from PySide6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
 
 from flowpdf.document_mode.export import (
     DocumentPdfExporter,
@@ -16,7 +20,12 @@ from flowpdf.document_mode.export import (
     ProjectWriter,
 )
 from flowpdf.document_mode.importing import ImportReport, ImportResult, PdfImportService
-from flowpdf.document_mode.models import FlowDocument
+from flowpdf.document_mode.models import FlowDocument, PageSetup
+from flowpdf.document_mode.recovery_service import (
+    DocumentRecoveryRecord,
+    DocumentRecoveryService,
+)
+from flowpdf.document_mode.ui import PageSetupDialog
 from flowpdf.services.task_service import TaskContext, TaskService
 
 if TYPE_CHECKING:
@@ -32,14 +41,17 @@ class DocumentModeController(QObject):
         *,
         artifact_registry=None,
         task_service: TaskService | None = None,
+        recovery_service: DocumentRecoveryService,
     ) -> None:
         super().__init__(window)
         self.window = window
         self.tasks = task_service or TaskService(max_threads=1, parent=self)
         self._importer = PdfImportService()
         self._reader = ProjectReader()
-        self._writer = ProjectWriter()
+        self._writer = ProjectWriter(artifact_registry=artifact_registry)
         self._exporter = DocumentPdfExporter(artifact_registry=artifact_registry)
+        self.recovery_service = recovery_service
+        self.recovery_tasks = TaskService(max_threads=1, parent=self)
         self.document: FlowDocument | None = None
         self.import_report: ImportReport | None = None
         self.project_path: Path | None = None
@@ -47,6 +59,11 @@ class DocumentModeController(QObject):
         self.is_shutdown = False
         self._applying = False
         self._close_when_idle = False
+        self._session_id = uuid.uuid4().hex
+        self._recovery_path: Path | None = None
+        self._autosave = QTimer(self)
+        self._autosave.setInterval(15_000)
+        self._autosave.timeout.connect(self.flush_recovery)
 
         editor = self.window.document_editor_view.editor
         editor.model_changed.connect(self._mark_dirty)
@@ -59,6 +76,12 @@ class DocumentModeController(QObject):
         self.tasks.progress.connect(
             lambda _task_id, value, message: self.window.set_progress(value, message)
         )
+        self.recovery_tasks.busy_changed.connect(self._on_recovery_busy_changed)
+        toolbar = self.window.document_toolbar
+        toolbar.insert_image_requested.connect(self.insert_image_dialog)
+        toolbar.export_pdf_requested.connect(self.export_pdf)
+        toolbar.find_replace_requested.connect(self.find_replace_dialog)
+        toolbar.page_setup_requested.connect(self.page_setup_dialog)
 
     def import_pdf(
         self,
@@ -139,6 +162,57 @@ class DocumentModeController(QObject):
             priority=25,
         )
 
+    def offer_recovery(self, *, on_none: Callable[[], None] | None = None) -> None:
+        if self.document is not None or self.tasks.active_count or self.recovery_tasks.active_count:
+            return
+
+        def completed(records: list[tuple[Path, DocumentRecoveryRecord]]) -> None:
+            if not records:
+                if on_none is not None:
+                    on_none()
+                return
+            path, record = records[0]
+            while True:
+                box = QMessageBox(self.window)
+                box.setIcon(QMessageBox.Icon.Warning)
+                box.setWindowTitle("发现未完成的文档编辑会话")
+                shown_name = (
+                    Path(record.project_path or record.source_pdf_path).name or "未命名文档"
+                )
+                box.setText(f"检测到“{shown_name}”的文档模式恢复记录。")
+                box.setInformativeText("恢复后仍需保存 FlowPDF 工程，不会覆盖来源 PDF。")
+                restore_button = box.addButton("恢复", QMessageBox.ButtonRole.AcceptRole)
+                discard_button = box.addButton("放弃", QMessageBox.ButtonRole.DestructiveRole)
+                details_button = box.addButton("查看详情", QMessageBox.ButtonRole.ActionRole)
+                box.addButton(QMessageBox.StandardButton.Cancel)
+                box.exec()
+                clicked = box.clickedButton()
+                if clicked is restore_button:
+                    self._restore_record(path, record)
+                    return
+                if clicked is discard_button:
+                    self.recovery_service.discard(path)
+                    if on_none is not None:
+                        on_none()
+                    return
+                if clicked is details_button:
+                    QMessageBox.information(
+                        self.window,
+                        "文档恢复详情",
+                        f"来源：{record.source_pdf_path or '无'}\n"
+                        f"工程：{record.project_path or '尚未保存'}\n"
+                        f"最后更新：{record.updated_at}\n"
+                        f"字符数：{len(record.document.plain_text)}",
+                    )
+                    continue
+                return
+
+        self.recovery_tasks.submit(
+            lambda _context: self.recovery_service.list_session_files(),
+            on_success=completed,
+            on_error=lambda error: self.window.set_saved_status(f"读取文档恢复记录失败：{error}"),
+        )
+
     def save_project(self, *, save_as: bool = False, on_complete=None) -> None:
         if self.document is None or self.tasks.active_count:
             return
@@ -169,6 +243,7 @@ class DocumentModeController(QObject):
             self.is_dirty = False
             self.window.setWindowTitle(f"{output.name} — FlowPDF")
             self.window.set_saved_status(f"工程已安全保存：{output.name}")
+            self._discard_recovery()
             if on_complete is not None:
                 on_complete()
 
@@ -226,6 +301,106 @@ class DocumentModeController(QObject):
             priority=30,
         )
 
+    def insert_image_dialog(self) -> None:
+        if self.document is None or self.tasks.active_count:
+            return
+        selected, _filter = QFileDialog.getOpenFileName(
+            self.window,
+            "插入文档图片",
+            "",
+            "图片 (*.png *.jpg *.jpeg *.webp)",
+        )
+        if not selected:
+            return
+        source = Path(selected)
+
+        def read_image(context: TaskContext) -> tuple[bytes, str, tuple[int, int]]:
+            if source.stat().st_size > 128 * 1024 * 1024:
+                raise ValueError("图片文件超过 128 MB 安全上限")
+            data = source.read_bytes()
+            context.report_progress(35, "正在后台验证图片")
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", Image.DecompressionBombWarning)
+                    with Image.open(io.BytesIO(data)) as decoded:
+                        size = decoded.size
+                        decoded.verify()
+            except (Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+                raise ValueError("图片解码资源异常") from exc
+            except (OSError, UnidentifiedImageError) as exc:
+                raise ValueError("图片内容损坏或格式不受支持") from exc
+            if size[0] * size[1] > 80_000_000:
+                raise ValueError("图片像素数量超过安全上限")
+            media_type = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+            }.get(source.suffix.casefold(), "application/octet-stream")
+            return data, media_type, size
+
+        def insert(result: tuple[bytes, str, tuple[int, int]]) -> None:
+            data, media_type, size = result
+            self.window.document_editor_view.editor.insert_image(
+                data,
+                media_type=media_type,
+                pixel_size=size,
+                alt_text=source.stem,
+            )
+            self.window.set_saved_status(f"已插入图片：{source.name}")
+
+        self.tasks.submit(
+            read_image,
+            on_success=insert,
+            on_error=lambda error: self.window.show_error("无法插入图片", str(error)),
+        )
+
+    def find_replace_dialog(self) -> None:
+        if self.document is None:
+            return
+        query, accepted = QInputDialog.getText(self.window, "查找替换", "查找内容：")
+        if not accepted or not query:
+            return
+        replacement, accepted = QInputDialog.getText(self.window, "查找替换", "替换为：")
+        if not accepted:
+            return
+        count = self.window.document_editor_view.editor.replace_all(query, replacement)
+        self.window.set_saved_status(f"已替换 {count} 处")
+
+    def page_setup_dialog(self) -> None:
+        if self.document is None:
+            return
+        current = self.window.document_editor_view.editor.flow_document()
+        dialog = PageSetupDialog(current.page_setup, self.window)
+        if dialog.exec():
+            try:
+                self.set_page_setup(dialog.page_setup())
+            except ValueError as error:
+                self.window.show_error("页面设置无效", str(error))
+
+    def set_page_setup(self, setup: PageSetup) -> None:
+        if self.document is None:
+            return
+        editor = self.window.document_editor_view.editor
+        document = editor.flow_document()
+        cursor = editor.textCursor()
+        position, anchor = cursor.position(), cursor.anchor()
+        scroll = editor.verticalScrollBar().value()
+        document.page_setup = setup
+        self._applying = True
+        try:
+            editor.set_flow_document(document)
+            self.window.document_editor_view.restore_cursor(position, anchor, scroll)
+            self.document = document
+        finally:
+            self._applying = False
+        self.is_dirty = True
+        self.window.update_document_mode_status(
+            self.window.document_editor_view.current_page,
+            editor.page_count,
+        )
+        self.window.set_saved_status("页面设置已修改")
+
     def undo(self) -> None:
         if self.document is not None:
             self.window.document_editor_view.editor.undo()
@@ -252,14 +427,18 @@ class DocumentModeController(QObject):
             if answer is QMessageBox.StandardButton.Save:
                 self.save_project(on_complete=self.window.force_close_after_save)
                 return False
+            discard = True
+        if discard:
+            self._discard_recovery()
         self._clear_document()
         return True
 
     def request_close(self) -> bool:
         if self.is_shutdown:
             return True
-        if self.tasks.active_count:
+        if self.tasks.active_count or self.recovery_tasks.active_count:
             self.tasks.cancel_all()
+            self.recovery_tasks.cancel_all()
             self._close_when_idle = True
             self.window.set_saved_status("正在取消文档模式后台任务，完成后将退出…")
             return False
@@ -270,7 +449,8 @@ class DocumentModeController(QObject):
     def shutdown(self) -> bool:
         if self.is_shutdown:
             return True
-        finished = self.tasks.shutdown()
+        self._autosave.stop()
+        finished = self.tasks.shutdown() and self.recovery_tasks.shutdown()
         self.is_shutdown = finished
         return finished
 
@@ -289,8 +469,12 @@ class DocumentModeController(QObject):
         finally:
             self._applying = False
         self._history_changed()
+        self._session_id = uuid.uuid4().hex
+        self._recovery_path = None
+        self._autosave.start()
 
     def _clear_document(self) -> None:
+        self._autosave.stop()
         self._applying = True
         try:
             self.window.clear_document_editor()
@@ -308,6 +492,35 @@ class DocumentModeController(QObject):
         self.window.set_saved_status("文档结构有未保存修改")
         self.window.update_document_word_count(
             len(self.window.document_editor_view.editor.toPlainText().replace("\n", ""))
+        )
+
+    def flush_recovery(self) -> None:
+        if (
+            self.document is None
+            or not self.is_dirty
+            or self.recovery_tasks.active_count
+            or self.is_shutdown
+        ):
+            return
+        document = self.window.document_editor_view.editor.flow_document()
+        state = self._project_state()
+        session_id = self._session_id
+        project_path = str(self.project_path or "")
+
+        def completed(path: Path) -> None:
+            self._recovery_path = path
+            self.window.set_saved_status("文档模式恢复检查点已更新")
+
+        self.recovery_tasks.submit(
+            lambda _context: self.recovery_service.write(
+                session_id=session_id,
+                document=document,
+                state=state,
+                project_path=project_path,
+                unexported=True,
+            ),
+            on_success=completed,
+            on_error=lambda error: self.window.set_saved_status(f"自动恢复记录失败：{error}"),
         )
 
     def _history_changed(self, _available: bool | None = None) -> None:
@@ -350,6 +563,29 @@ class DocumentModeController(QObject):
             if self._close_when_idle:
                 self._close_when_idle = False
                 QTimer.singleShot(0, self.window.close)
+
+    def _on_recovery_busy_changed(self, busy: bool) -> None:
+        if not busy and self._close_when_idle and not self.tasks.active_count:
+            self._close_when_idle = False
+            QTimer.singleShot(0, self.window.close)
+
+    def _restore_record(self, path: Path, record: DocumentRecoveryRecord) -> None:
+        self._apply_document(record.document)
+        self._session_id = record.session_id
+        self._recovery_path = path
+        self.project_path = Path(record.project_path) if record.project_path else None
+        self.window.document_editor_view.restore_cursor(
+            record.state.cursor_position,
+            record.state.selection_anchor,
+            record.state.scroll_y,
+        )
+        self.is_dirty = True
+        self.window.set_saved_status("已恢复未保存文档；来源 PDF 未被覆盖")
+
+    def _discard_recovery(self) -> None:
+        if self._recovery_path is not None:
+            self.recovery_service.discard(self._recovery_path)
+            self._recovery_path = None
 
 
 def _safe_progress(context: TaskContext, value: int, message: str) -> None:

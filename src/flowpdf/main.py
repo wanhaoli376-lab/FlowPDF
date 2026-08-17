@@ -22,6 +22,7 @@ def main() -> int:
         logger = get_logger(__name__)
         window.show()
         if smoke_test:
+            window.lifecycle_controller.mode_selector = lambda _report: "layout"
             failures: list[str] = []
             window.show_error = lambda title, message: failures.append(f"{title}: {message}")
             input_pdf = len(arguments) > 1 and Path(arguments[1]).suffix.casefold() == ".pdf"
@@ -60,7 +61,7 @@ def main() -> int:
             else:
                 QTimer.singleShot(750, window.close)
         else:
-            QTimer.singleShot(0, window.controller.offer_recovery)
+            QTimer.singleShot(0, window.lifecycle_controller.offer_recovery)
         result = app.exec()
         return 2 if smoke_test and failures else result
     except Exception:

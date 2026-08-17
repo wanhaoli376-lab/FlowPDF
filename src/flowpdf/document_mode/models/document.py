@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from flowpdf.document_mode.models.assets import ImageAsset
-from flowpdf.document_mode.models.blocks import Block, Paragraph
+from flowpdf.document_mode.models.blocks import Block, BlockImage, Paragraph
 
 
 @dataclass(slots=True)
@@ -88,7 +88,7 @@ class FlowDocument:
             for block in section.blocks:
                 if isinstance(block, Paragraph):
                     block.normalize()
-                elif block.asset_id not in self.assets:
+                elif isinstance(block, BlockImage) and block.asset_id not in self.assets:
                     raise ValueError(f"图片块引用了不存在的资产：{block.asset_id}")
 
     @property

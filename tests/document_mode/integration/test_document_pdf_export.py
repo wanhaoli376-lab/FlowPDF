@@ -11,6 +11,7 @@ from flowpdf.document_mode.models import (
     BlockImage,
     FlowDocument,
     ImageAsset,
+    PageBreak,
     PageSetup,
     Paragraph,
     ParagraphAlignment,
@@ -129,3 +130,20 @@ def test_export_cancellation_does_not_modify_target(qapp, tmp_path) -> None:
 
     assert target.read_bytes() == b"keep me"
     assert list(tmp_path.glob(".flowpdf-*.tmp.pdf")) == []
+
+
+def test_export_honors_structural_page_break(qapp, tmp_path) -> None:
+    document = FlowDocument.new()
+    document.append_block(Paragraph(runs=[TextRun("硬分页之前")]))
+    document.append_block(PageBreak())
+    document.append_block(Paragraph(runs=[TextRun("硬分页之后")]))
+    output = tmp_path / "硬分页.pdf"
+
+    result = DocumentPdfExporter().export(document, output)
+    exported = pymupdf.open(output)
+    try:
+        assert result.page_count == 2
+        assert "硬分页之前" in exported[0].get_text()
+        assert "硬分页之后" in exported[1].get_text()
+    finally:
+        exported.close()
