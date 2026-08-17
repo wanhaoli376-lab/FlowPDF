@@ -59,6 +59,9 @@ class DocumentModeController(QObject):
         self.is_shutdown = False
         self._applying = False
         self._close_when_idle = False
+        self._edit_revision = 0
+        self._recovery_epoch = 0
+        self._checkpoint_after_recovery = False
         self._session_id = uuid.uuid4().hex
         self._recovery_path: Path | None = None
         self._autosave = QTimer(self)
@@ -150,6 +153,7 @@ class DocumentModeController(QObject):
                 bundle.state.cursor_position,
                 bundle.state.selection_anchor,
                 bundle.state.scroll_y,
+                bundle.state.zoom_factor,
             )
             self.is_dirty = False
             self.window.setWindowTitle(f"{source.name} — FlowPDF")
@@ -236,21 +240,39 @@ class DocumentModeController(QObject):
         target = Path(path)
         document = self.window.document_editor_view.editor.flow_document()
         state = self._project_state()
+        saved_revision = self._edit_revision
+        self._invalidate_recovery_tasks()
 
         def completed(output: Path) -> None:
-            self.document = document
             self.project_path = output
-            self.is_dirty = False
             self.window.setWindowTitle(f"{output.name} — FlowPDF")
-            self.window.set_saved_status(f"工程已安全保存：{output.name}")
-            self._discard_recovery()
-            if on_complete is not None:
-                on_complete()
+            if self._edit_revision == saved_revision:
+                self.document = document
+                self.is_dirty = False
+                self.window.set_saved_status(f"工程已安全保存：{output.name}")
+                self._discard_recovery()
+                if on_complete is not None:
+                    on_complete()
+            else:
+                self.is_dirty = True
+                self.window.set_saved_status("工程快照已保存，但保存期间有新修改，请再次保存")
+                if self.recovery_tasks.active_count:
+                    self._checkpoint_after_recovery = True
+                else:
+                    self.flush_recovery()
+
+        def failed(error: Exception) -> None:
+            self.window.show_error("工程保存失败", str(error))
+            if self.is_dirty:
+                if self.recovery_tasks.active_count:
+                    self._checkpoint_after_recovery = True
+                else:
+                    self.flush_recovery()
 
         self.tasks.submit(
             lambda _context: self._writer.save(document, target, state=state),
             on_success=completed,
-            on_error=lambda error: self.window.show_error("工程保存失败", str(error)),
+            on_error=failed,
             priority=30,
         )
 
@@ -277,20 +299,27 @@ class DocumentModeController(QObject):
             return
         target = Path(path)
         document = self.window.document_editor_view.editor.flow_document()
+        exported_revision = self._edit_revision
+        expected_pages = self.window.document_editor_view.editor.page_count
 
         def perform(context: TaskContext) -> PdfExportResult:
             return self._exporter.export(
                 document,
                 target,
+                expected_page_count=expected_pages,
                 cancel_check=lambda: context.is_cancelled,
                 progress=lambda value, message: _safe_progress(context, value, message),
             )
 
         def completed(result: PdfExportResult) -> None:
-            self.document = document
-            self.window.set_saved_status(
-                f"已导出可搜索 PDF：{result.output_path.name}（{result.page_count} 页）"
-            )
+            if self._edit_revision == exported_revision:
+                self.document = document
+                status = f"已导出可搜索 PDF：{result.output_path.name}（{result.page_count} 页）"
+                if not result.pagination_matches:
+                    status += f"；编辑预览为 {result.preview_page_count} 页，请检查分页"
+            else:
+                status = "PDF 快照已导出，但导出期间有新修改；当前文档仍未导出"
+            self.window.set_saved_status(status)
             if on_complete is not None:
                 on_complete(result)
 
@@ -386,15 +415,17 @@ class DocumentModeController(QObject):
         cursor = editor.textCursor()
         position, anchor = cursor.position(), cursor.anchor()
         scroll = editor.verticalScrollBar().value()
+        zoom = editor.zoom_factor
         document.page_setup = setup
         self._applying = True
         try:
             editor.set_flow_document(document)
-            self.window.document_editor_view.restore_cursor(position, anchor, scroll)
+            self.window.document_editor_view.restore_cursor(position, anchor, scroll, zoom)
             self.document = document
         finally:
             self._applying = False
         self.is_dirty = True
+        self._edit_revision += 1
         self.window.update_document_mode_status(
             self.window.document_editor_view.current_page,
             editor.page_count,
@@ -429,6 +460,7 @@ class DocumentModeController(QObject):
                 return False
             discard = True
         if discard:
+            self._invalidate_recovery_tasks()
             self._discard_recovery()
         self._clear_document()
         return True
@@ -471,6 +503,8 @@ class DocumentModeController(QObject):
         finally:
             self._applying = False
         self._history_changed()
+        self._edit_revision = 0
+        self._checkpoint_after_recovery = False
         self._session_id = uuid.uuid4().hex
         self._recovery_path = None
         self._autosave.start()
@@ -491,6 +525,7 @@ class DocumentModeController(QObject):
         if self._applying or self.document is None:
             return
         self.is_dirty = True
+        self._edit_revision += 1
         self.window.set_saved_status("文档结构有未保存修改")
         self.window.update_document_word_count(
             len(self.window.document_editor_view.editor.toPlainText().replace("\n", ""))
@@ -507,20 +542,34 @@ class DocumentModeController(QObject):
         document = self.window.document_editor_view.editor.flow_document()
         state = self._project_state()
         session_id = self._session_id
+        recovery_epoch = self._recovery_epoch
         project_path = str(self.project_path or "")
 
         def completed(path: Path) -> None:
+            if (
+                recovery_epoch != self._recovery_epoch
+                or session_id != self._session_id
+                or self.document is None
+            ):
+                self.recovery_service.discard(path)
+                return
             self._recovery_path = path
             self.window.set_saved_status("文档模式恢复检查点已更新")
 
-        self.recovery_tasks.submit(
-            lambda _context: self.recovery_service.write(
+        def write_checkpoint(context: TaskContext) -> Path:
+            path = self.recovery_service.write(
                 session_id=session_id,
                 document=document,
                 state=state,
                 project_path=project_path,
                 unexported=True,
-            ),
+            )
+            if context.is_cancelled:
+                self.recovery_service.discard(path)
+            return path
+
+        self.recovery_tasks.submit(
+            write_checkpoint,
             on_success=completed,
             on_error=lambda error: self.window.set_saved_status(f"自动恢复记录失败：{error}"),
         )
@@ -542,6 +591,7 @@ class DocumentModeController(QObject):
             selection_anchor=cursor.anchor(),
             scroll_y=editor.verticalScrollBar().value(),
             current_page=self.window.document_editor_view.current_page,
+            zoom_factor=editor.zoom_factor,
         )
 
     def _suggested_project_path(self) -> Path:
@@ -567,6 +617,10 @@ class DocumentModeController(QObject):
                 QTimer.singleShot(0, self.window.close)
 
     def _on_recovery_busy_changed(self, busy: bool) -> None:
+        if not busy and self._checkpoint_after_recovery:
+            self._checkpoint_after_recovery = False
+            if self.is_dirty and not self.tasks.active_count and not self.is_shutdown:
+                self.flush_recovery()
         if not busy and self._close_when_idle and not self.tasks.active_count:
             self._close_when_idle = False
             QTimer.singleShot(0, self.window.close)
@@ -580,14 +634,25 @@ class DocumentModeController(QObject):
             record.state.cursor_position,
             record.state.selection_anchor,
             record.state.scroll_y,
+            record.state.zoom_factor,
         )
         self.is_dirty = True
+        self._edit_revision = 1
         self.window.set_saved_status("已恢复未保存文档；来源 PDF 未被覆盖")
 
     def _discard_recovery(self) -> None:
+        self.recovery_service.discard_session(self._session_id)
         if self._recovery_path is not None:
             self.recovery_service.discard(self._recovery_path)
             self._recovery_path = None
+
+    @property
+    def edit_revision(self) -> int:
+        return self._edit_revision
+
+    def _invalidate_recovery_tasks(self) -> None:
+        self._recovery_epoch += 1
+        self.recovery_tasks.cancel_all()
 
 
 def _safe_progress(context: TaskContext, value: int, message: str) -> None:

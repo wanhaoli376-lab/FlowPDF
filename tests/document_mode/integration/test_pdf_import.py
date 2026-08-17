@@ -167,8 +167,10 @@ def test_import_reconstructs_bullet_numbering_and_conditional_english_hyphen(tmp
 
     assert paragraphs[0].semantic_role is SemanticRole.LIST_ITEM
     assert paragraphs[0].style.list_kind == "bullet"
+    assert paragraphs[0].text == "Bullet item"
     assert paragraphs[1].semantic_role is SemanticRole.LIST_ITEM
     assert paragraphs[1].style.list_kind == "number"
+    assert paragraphs[1].text == "Numbered item"
     assert paragraphs[2].text == "electromagnetic field"
 
 

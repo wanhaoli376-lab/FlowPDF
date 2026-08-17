@@ -39,6 +39,11 @@ class PdfExportResult:
     page_count: int
     file_size: int
     image_count: int
+    preview_page_count: int | None = None
+
+    @property
+    def pagination_matches(self) -> bool:
+        return self.preview_page_count is None or self.preview_page_count == self.page_count
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +67,7 @@ class DocumentPdfExporter:
         document: FlowDocument,
         output_path: str | Path,
         *,
+        expected_page_count: int | None = None,
         cancel_check: Callable[[], bool] | None = None,
         progress: Callable[[int, str], None] | None = None,
     ) -> PdfExportResult:
@@ -109,6 +115,7 @@ class DocumentPdfExporter:
                 validation.page_count,
                 validation.file_size,
                 validation.image_count,
+                expected_page_count,
             )
         except (PdfExportError, PdfExportValidationError):
             raise
@@ -139,42 +146,18 @@ class DocumentPdfExporter:
         archive = pymupdf.Archive()
         for asset in document.assets.values():
             archive.add(asset.data, asset.file_name)
-        story = pymupdf.Story(
-            _document_html(document),
-            user_css=_document_css(),
-            em=11,
-            archive=archive,
-        )
-        writer = pymupdf.DocumentWriter(str(story_output))
         setup = document.page_setup
         mediabox = pymupdf.Rect(0, 0, setup.width_pt, setup.height_pt)
-        content = pymupdf.Rect(
-            setup.margin_left_pt,
-            setup.margin_top_pt,
-            setup.width_pt - setup.margin_right_pt,
-            setup.height_pt - setup.margin_bottom_pt,
+        full_height = setup.height_pt - setup.margin_top_pt - setup.margin_bottom_pt
+        page_counter, cancelled_during_layout = _write_story_layout(
+            document,
+            archive,
+            story_output,
+            mediabox,
+            content_height=full_height,
+            cancel=cancel,
+            progress=progress,
         )
-        page_counter = 0
-        cancelled_during_layout = False
-
-        def rect_for_page(
-            _rect_number: int,
-            _filled: pymupdf.Rect,
-        ) -> tuple[pymupdf.Rect, pymupdf.Rect, None]:
-            nonlocal cancelled_during_layout, page_counter
-            if cancel():
-                cancelled_during_layout = True
-            page_counter += 1
-            progress(
-                min(75, 10 + page_counter * 5),
-                f"正在排版第 {page_counter} 页",
-            )
-            return mediabox, content, None
-
-        try:
-            story.write(writer, rect_for_page)
-        finally:
-            writer.close()
         if cancelled_during_layout:
             # Return cancellation instead of raising while Story and DocumentWriter are
             # still referenced by an exception frame. On Windows that traceback kept
@@ -190,6 +173,52 @@ class DocumentPdfExporter:
     def _raise_if_cancelled(cancel: Callable[[], bool]) -> None:
         if cancel():
             raise PdfExportCancelled("PDF 导出已取消，目标文件未被修改")
+
+
+def _write_story_layout(
+    document: FlowDocument,
+    archive: pymupdf.Archive,
+    output: Path,
+    mediabox: pymupdf.Rect,
+    *,
+    content_height: float,
+    cancel: Callable[[], bool],
+    progress: Callable[[int, str], None],
+) -> tuple[int, bool]:
+    if output.exists() and not output.is_symlink():
+        output.unlink()
+    story = pymupdf.Story(
+        _document_html(document),
+        user_css=_document_css(),
+        em=11,
+        archive=archive,
+    )
+    writer = pymupdf.DocumentWriter(str(output))
+    setup = document.page_setup
+    content = pymupdf.Rect(
+        setup.margin_left_pt,
+        setup.margin_top_pt,
+        setup.width_pt - setup.margin_right_pt,
+        setup.margin_top_pt + content_height,
+    )
+    page_counter = 0
+    cancelled = False
+
+    def rect_for_page(
+        _rect_number: int,
+        _filled: pymupdf.Rect,
+    ) -> tuple[pymupdf.Rect, pymupdf.Rect, None]:
+        nonlocal cancelled, page_counter
+        cancelled = cancelled or cancel()
+        page_counter += 1
+        progress(min(75, 10 + page_counter * 5), f"正在排版第 {page_counter} 页")
+        return mediabox, content, None
+
+    try:
+        story.write(writer, rect_for_page)
+    finally:
+        writer.close()
+    return page_counter, cancelled
 
 
 def _decorate_pdf(
@@ -313,6 +342,10 @@ def _paragraph_runs(paragraph: Paragraph) -> str:
 
 def _paragraph_css(paragraph: Paragraph) -> str:
     style = paragraph.style
+    # Qt and MuPDF Story use different font metrics for the same nominal CJK point
+    # size. This conversion keeps line boxes close without changing the page content
+    # rectangle or the user's configured margins.
+    story_line_height = style.line_spacing * 1.15
     return ";".join(
         (
             f"text-align:{style.alignment.value}",
@@ -321,7 +354,7 @@ def _paragraph_css(paragraph: Paragraph) -> str:
             f"margin-right:{style.right_indent_pt}pt",
             f"margin-top:{style.space_before_pt}pt",
             f"margin-bottom:{style.space_after_pt}pt",
-            f"line-height:{style.line_spacing}",
+            f"line-height:{story_line_height}",
             "page-break-inside:avoid" if style.keep_together else "",
             "page-break-after:avoid" if style.keep_with_next else "",
         )

@@ -181,6 +181,16 @@ class DocumentRecoveryService:
         self._prune_unreferenced_assets()
         return True
 
+    def discard_session(self, session_id: str) -> bool:
+        """Remove the deterministic checkpoint for a known in-memory session."""
+        if not session_id:
+            return False
+        digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:24]
+        candidate = self.root / f"document-recovery-{digest}.json.gz"
+        if not candidate.exists():
+            return False
+        return self.discard(candidate)
+
     def _store_asset(self, asset: ImageAsset) -> str:
         if not asset.data or len(asset.data) > self.MAX_ASSET_BYTES:
             raise DocumentRecoveryError("文档恢复图片为空或超过安全大小上限")

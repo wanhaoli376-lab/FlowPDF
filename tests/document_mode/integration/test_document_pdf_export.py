@@ -147,3 +147,19 @@ def test_export_honors_structural_page_break(qapp, tmp_path) -> None:
         assert "硬分页之后" in exported[1].get_text()
     finally:
         exported.close()
+
+
+def test_export_reports_preview_page_mismatch_without_changing_page_margins(qapp, tmp_path) -> None:
+    document = _export_document()
+    output = tmp_path / "分页差异.pdf"
+
+    result = DocumentPdfExporter().export(document, output, expected_page_count=999)
+
+    assert result.preview_page_count == 999
+    assert not result.pagination_matches
+    exported = pymupdf.open(output)
+    try:
+        assert exported.page_count == result.page_count
+        assert abs(exported[0].rect.height - document.page_setup.height_pt) < 1
+    finally:
+        exported.close()

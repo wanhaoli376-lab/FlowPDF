@@ -39,7 +39,11 @@ class ModeChoiceDialog(QDialog):
         document_button = QPushButton("像 Word 一样编辑", self)
         layout_button = QPushButton("保持原版式编辑", self)
         details_button = QPushButton("查看分析详情", self)
-        recommended = document_button if report.recommended_mode == "document" else layout_button
+        recommended = (
+            document_button
+            if report.recommended_mode in {"document", "document_with_warning"}
+            else layout_button
+        )
         recommended.setDefault(True)
         document_button.clicked.connect(self._choose_document)
         layout_button.clicked.connect(lambda: self._finish("layout"))

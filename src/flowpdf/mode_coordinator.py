@@ -177,8 +177,29 @@ class ModeCoordinator(QObject):
             return
         snapshot = self.temp_files.create(suffix=".pdf")
         self._mode_snapshots.add(snapshot)
+        snapshot_revision = self.document_controller.edit_revision
 
         def exported(_result) -> None:
+            if self.document_controller.edit_revision != snapshot_revision:
+                self.temp_files.discard(snapshot)
+                self._mode_snapshots.discard(snapshot)
+                self.window.document_mode_action.setChecked(True)
+                self.window.set_saved_status("导出期间文档有新修改，未切换模式；请再次切换")
+                return
+            if not _result.pagination_matches:
+                answer = QMessageBox.warning(
+                    self.window,
+                    "快照分页发生变化",
+                    f"固定版式快照为 {_result.page_count} 页，编辑预览为 "
+                    f"{_result.preview_page_count} 页。字体度量差异可能改变分页，仍要切换吗？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                if answer is not QMessageBox.StandardButton.Yes:
+                    self.temp_files.discard(snapshot)
+                    self._mode_snapshots.discard(snapshot)
+                    self.window.document_mode_action.setChecked(True)
+                    return
             self.document_controller.close_document(discard=True)
             self.layout_controller.open_path(snapshot, confirmed=True)
 
@@ -214,6 +235,7 @@ class ModeCoordinator(QObject):
         choice = self.mode_selector(result.report)
         if choice == "document":
             self.layout_controller.close_document(discard=True)
+            self.document_controller.close_document(discard=True)
             self.document_controller.apply_import_result(result, source)
             self.layout_controller.recent_files.add(source)
             self.window.set_recent_files(self.layout_controller.recent_files.paths())

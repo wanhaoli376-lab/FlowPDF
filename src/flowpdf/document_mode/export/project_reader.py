@@ -57,10 +57,10 @@ class ProjectReader:
                 return ProjectBundle(document, manifest.state, manifest)
         except ProjectError:
             raise
-        except (OSError, UnicodeError, ValueError, KeyError, zipfile.BadZipFile) as exc:
-            raise ProjectError("FlowPDF 工程已损坏或格式无效") from exc
         except DocumentFormatError as exc:
             raise ProjectError(str(exc)) from exc
+        except (OSError, UnicodeError, ValueError, KeyError, zipfile.BadZipFile) as exc:
+            raise ProjectError("FlowPDF 工程已损坏或格式无效") from exc
 
     def _validated_members(self, archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
         infos = archive.infolist()

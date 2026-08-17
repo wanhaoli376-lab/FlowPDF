@@ -618,13 +618,16 @@ class MainWindow(QMainWindow):
     def _connect_view_controls(self) -> None:
         self._welcome.open_requested.connect(self.open_action.trigger)
         self._welcome.new_requested.connect(self.new_action.trigger)
-        self.zoom_in_action.triggered.connect(self.document_view.zoom_in)
-        self.zoom_out_action.triggered.connect(self.document_view.zoom_out)
-        self.actual_size_action.triggered.connect(self.document_view.actual_size)
+        self.zoom_in_action.triggered.connect(self._zoom_in)
+        self.zoom_out_action.triggered.connect(self._zoom_out)
+        self.actual_size_action.triggered.connect(self._actual_size)
         self.fit_page_action.triggered.connect(self.document_view.fit_page)
         self.fit_width_action.triggered.connect(self.document_view.fit_width)
         self.continuous_action.toggled.connect(self.document_view.set_continuous_mode)
         self.document_view.zoom_changed.connect(
+            lambda zoom: self.zoom_status.setText(f"{round(zoom * 100)}%")
+        )
+        self.document_editor_view.editor.zoom_changed.connect(
             lambda zoom: self.zoom_status.setText(f"{round(zoom * 100)}%")
         )
         self.document_view.current_page_changed.connect(self._update_page_status)
@@ -655,6 +658,24 @@ class MainWindow(QMainWindow):
                 text = getattr(block, "text", "").strip()
                 if text:
                     self.document_outline_list.addItem(text[:80])
+
+    def _zoom_in(self) -> None:
+        if self.active_mode == "document":
+            self.document_editor_view.editor.zoom_in()
+        else:
+            self.document_view.zoom_in()
+
+    def _zoom_out(self) -> None:
+        if self.active_mode == "document":
+            self.document_editor_view.editor.zoom_out()
+        else:
+            self.document_view.zoom_out()
+
+    def _actual_size(self) -> None:
+        if self.active_mode == "document":
+            self.document_editor_view.editor.actual_size()
+        else:
+            self.document_view.actual_size()
 
     def _apply_mode_ui(self) -> None:
         is_document = self.active_mode == "document"

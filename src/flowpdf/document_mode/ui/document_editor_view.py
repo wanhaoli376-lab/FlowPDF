@@ -1,12 +1,53 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout, QWidget
+from PySide6.QtGui import QResizeEvent, QTextCursor
+from PySide6.QtWidgets import (
+    QFrame,
+    QGraphicsScene,
+    QGraphicsView,
+    QLabel,
+    QVBoxLayout,
+    QWidget,
+)
 
 from flowpdf.document_mode.editing import PaginatedTextEdit
 from flowpdf.document_mode.importing import ImportReport
 from flowpdf.document_mode.models import FlowDocument
+
+
+class _ZoomableEditorCanvas(QGraphicsView):
+    """Scale the complete editor widget so text, images, margins and cursors stay aligned."""
+
+    def __init__(self, editor: PaginatedTextEdit, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.editor = editor
+        self._zoom_factor = 1.0
+        scene = QGraphicsScene(self)
+        self._proxy = scene.addWidget(editor)
+        self.setScene(scene)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        editor.zoom_changed.connect(self.set_zoom_factor)
+
+    def set_zoom_factor(self, factor: float) -> None:
+        self._zoom_factor = factor
+        self.resetTransform()
+        self.scale(factor, factor)
+        self._resize_proxy()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._resize_proxy()
+
+    def _resize_proxy(self) -> None:
+        viewport = self.viewport().size()
+        width = max(1.0, viewport.width() / self._zoom_factor)
+        height = max(1.0, viewport.height() / self._zoom_factor)
+        self._proxy.resize(width, height)
+        self.scene().setSceneRect(self._proxy.boundingRect())
 
 
 class DocumentEditorView(QWidget):
@@ -29,12 +70,13 @@ class DocumentEditorView(QWidget):
         self.import_notice.setWordWrap(True)
         self.import_notice.setFrameShape(QFrame.Shape.StyledPanel)
         self.import_notice.hide()
+        self.editor_canvas = _ZoomableEditorCanvas(self.editor, self)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(38, 20, 38, 20)
         layout.setSpacing(10)
         layout.addWidget(self.import_notice)
-        layout.addWidget(self.editor, 1, Qt.AlignmentFlag.AlignHCenter)
+        layout.addWidget(self.editor_canvas, 1)
         self.setStyleSheet("DocumentEditorView { background: #e5e7eb; }")
 
         self.editor.pagination_changed.connect(self._emit_page_status)
@@ -56,7 +98,7 @@ class DocumentEditorView(QWidget):
         else:
             recommendation = (
                 "推荐文档编辑模式"
-                if report.recommended_mode == "document"
+                if report.recommended_mode in {"document", "document_with_warning"}
                 else "复杂版式，建议改用版面编辑模式"
             )
             warning = f"；{report.warnings[0]}" if report.warnings else ""
@@ -68,7 +110,14 @@ class DocumentEditorView(QWidget):
         self.editor.clear()
         self.import_notice.hide()
 
-    def restore_cursor(self, position: int, anchor: int, scroll_y: int) -> None:
+    def restore_cursor(
+        self,
+        position: int,
+        anchor: int,
+        scroll_y: int,
+        zoom_factor: float = 1.0,
+    ) -> None:
+        self.editor.set_zoom_factor(zoom_factor)
         end = max(0, self.editor.document().characterCount() - 1)
         cursor = QTextCursor(self.editor.document())
         cursor.setPosition(min(max(0, anchor), end))

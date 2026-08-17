@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import html
 import io
 import re
 import warnings
+from html.parser import HTMLParser
+from typing import ClassVar
 
 from PIL import Image, UnidentifiedImageError
-from PySide6.QtCore import QMimeData, Qt, QTimer, Signal
+from PySide6.QtCore import QMimeData, QSizeF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -20,7 +23,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QTextEdit
 
-from flowpdf.document_mode.editing.document_mapper import DocumentMapper
+from flowpdf.document_mode.editing.document_mapper import BASE_FONT_SIZE_PT, DocumentMapper
 from flowpdf.document_mode.layout import PageGeometry, PaginationSnapshot, Paginator
 from flowpdf.document_mode.models import FlowDocument, ImageAsset
 
@@ -30,18 +33,24 @@ class PaginatedTextEdit(QTextEdit):
 
     pagination_changed = Signal(int)
     model_changed = Signal()
+    zoom_changed = Signal(float)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._mapper = DocumentMapper()
         self._geometry = PageGeometry.from_setup(FlowDocument.new().page_setup)
         self._page_count = 1
+        self._zoom_factor = 1.0
         self._pagination_timer = QTimer(self)
         self._pagination_timer.setSingleShot(True)
         self._pagination_timer.setInterval(180)
         self._pagination_timer.timeout.connect(self._emit_pagination)
         self.setAcceptRichText(True)
         self.setUndoRedoEnabled(True)
+        default_font = self.document().defaultFont()
+        default_font.setPointSizeF(BASE_FONT_SIZE_PT)
+        self.document().setDefaultFont(default_font)
+        self.setFont(default_font)
         self.setLineWrapMode(QTextEdit.LineWrapMode.FixedPixelWidth)
         self.document().contentsChanged.connect(self._schedule_layout_update)
         self.setStyleSheet(
@@ -56,13 +65,40 @@ class PaginatedTextEdit(QTextEdit):
     def page_count(self) -> int:
         return self.pagination_snapshot().page_count
 
+    @property
+    def zoom_factor(self) -> float:
+        return self._zoom_factor
+
     def set_flow_document(self, document: FlowDocument) -> None:
+        self.set_zoom_factor(1.0)
         self._geometry = PageGeometry.from_setup(document.page_setup)
-        self.setLineWrapColumnOrWidth(round(self._geometry.content_width_px))
         self._geometry = self._mapper.populate(self.document(), document)
-        self.setMinimumWidth(round(self._geometry.content_width_px + 72))
+        self._apply_zoom_geometry()
         self._page_count = self.page_count
         self.moveCursor(QTextCursor.MoveOperation.Start)
+
+    def zoom_in(self) -> None:
+        self.set_zoom_factor(self._zoom_factor + 0.1)
+
+    def zoom_out(self) -> None:
+        self.set_zoom_factor(self._zoom_factor - 0.1)
+
+    def actual_size(self) -> None:
+        self.set_zoom_factor(1.0)
+
+    def set_zoom_factor(self, factor: float) -> None:
+        selected = round(min(3.0, max(0.5, factor)), 1)
+        if selected == self._zoom_factor:
+            return
+        self._zoom_factor = selected
+        self.zoom_changed.emit(self.zoom_factor)
+
+    def _apply_zoom_geometry(self) -> None:
+        width = self._geometry.content_width_px
+        height = self._geometry.content_height_px
+        self.setLineWrapColumnOrWidth(round(width))
+        self.document().setPageSize(QSizeF(width, height))
+        self.setMinimumWidth(0)
 
     def flow_document(self) -> FlowDocument:
         return self._mapper.to_model(self.document())
@@ -172,7 +208,7 @@ class PaginatedTextEdit(QTextEdit):
         cursor = self.textCursor()
         value = QTextCharFormat()
         value.setFontFamilies(["Microsoft YaHei"])
-        value.setFontPointSize(11.0)
+        value.setFontPointSize(BASE_FONT_SIZE_PT)
         if cursor.hasSelection():
             cursor.setCharFormat(value)
         else:
@@ -369,7 +405,10 @@ class PaginatedTextEdit(QTextEdit):
     def insertFromMimeData(self, source: QMimeData) -> None:
         if source.hasHtml():
             clean = _sanitize_html(source.html())
-            self.textCursor().insertFragment(QTextDocumentFragment.fromHtml(clean))
+            cursor = self.textCursor()
+            cursor.beginEditBlock()
+            cursor.insertFragment(QTextDocumentFragment.fromHtml(clean))
+            cursor.endEditBlock()
             return
         super().insertFromMimeData(source)
 
@@ -411,20 +450,121 @@ class PaginatedTextEdit(QTextEdit):
 
 
 def _sanitize_html(value: str) -> str:
-    cleaned = re.sub(
-        r"<(script|style|iframe|object|embed)\b[^>]*>.*?</\1\s*>",
-        "",
-        value,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    cleaned = re.sub(r"\s+on[a-z]+\s*=\s*(['\"]).*?\1", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(
-        r"\s+(?:src|href)\s*=\s*(['\"])javascript:.*?\1",
-        "",
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    return cleaned
+    parser = _SafeRichTextParser()
+    parser.feed(value)
+    parser.close()
+    return "".join(parser.output)
+
+
+class _SafeRichTextParser(HTMLParser):
+    _ALLOWED_TAGS: ClassVar[set[str]] = {
+        "p",
+        "div",
+        "span",
+        "br",
+        "b",
+        "i",
+        "u",
+        "s",
+        "sub",
+        "sup",
+        "ul",
+        "ol",
+        "li",
+        "h1",
+        "h2",
+        "h3",
+        "blockquote",
+    }
+    _DROP_CONTENT_TAGS: ClassVar[set[str]] = {
+        "script",
+        "style",
+        "iframe",
+        "object",
+        "embed",
+        "svg",
+        "math",
+    }
+    _TAG_ALIASES: ClassVar[dict[str, str]] = {
+        "strong": "b",
+        "em": "i",
+        "strike": "s",
+        "a": "span",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.output: list[str] = []
+        self._drop_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        normalized = tag.casefold()
+        if normalized in self._DROP_CONTENT_TAGS:
+            self._drop_depth += 1
+            return
+        if self._drop_depth:
+            return
+        normalized = self._TAG_ALIASES.get(normalized, normalized)
+        if normalized not in self._ALLOWED_TAGS:
+            return
+        style = next((value for name, value in attrs if name.casefold() == "style"), None)
+        safe_style = _sanitize_style(style or "")
+        attribute = f' style="{html.escape(safe_style, quote=True)}"' if safe_style else ""
+        self.output.append(f"<{normalized}{attribute}>")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized = tag.casefold()
+        if normalized in self._DROP_CONTENT_TAGS:
+            self._drop_depth = max(0, self._drop_depth - 1)
+            return
+        if self._drop_depth:
+            return
+        normalized = self._TAG_ALIASES.get(normalized, normalized)
+        if normalized in self._ALLOWED_TAGS and normalized != "br":
+            self.output.append(f"</{normalized}>")
+
+    def handle_data(self, data: str) -> None:
+        if not self._drop_depth:
+            self.output.append(html.escape(data))
+
+
+_SAFE_CSS_NAMES = {
+    "background-color",
+    "color",
+    "font-family",
+    "font-size",
+    "font-style",
+    "font-weight",
+    "line-height",
+    "margin-left",
+    "margin-right",
+    "text-align",
+    "text-decoration",
+    "text-indent",
+}
+_SAFE_CSS_VALUE = re.compile(r"^[\w\s#.,'\"()%+-]+$", re.UNICODE)
+
+
+def _sanitize_style(value: str) -> str:
+    declarations: list[str] = []
+    for declaration in value.split(";"):
+        name, separator, raw_value = declaration.partition(":")
+        name = name.strip().casefold()
+        selected = raw_value.strip()
+        if (
+            separator
+            and name in _SAFE_CSS_NAMES
+            and selected
+            and len(selected) <= 128
+            and _SAFE_CSS_VALUE.fullmatch(selected)
+            and "url" not in selected.casefold()
+            and "expression" not in selected.casefold()
+        ):
+            declarations.append(f"{name}:{selected}")
+    return ";".join(declarations)
 
 
 def _alignment(value: str) -> Qt.AlignmentFlag:

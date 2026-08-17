@@ -13,8 +13,11 @@ from flowpdf.document_mode.models import (
     PageBreak,
     PageSetup,
     Paragraph,
+    Section,
+    SourceReference,
     TextRun,
 )
+from flowpdf.document_mode.ui import DocumentEditorView
 
 
 def _reflow_document() -> FlowDocument:
@@ -111,13 +114,20 @@ def test_editor_supports_paragraph_merge_undo_redo_find_replace_and_safe_rich_pa
     assert editor.find_text("文档模式") is True
 
     mime = QMimeData()
-    mime.setHtml('<p onclick="bad()">安全内容<script>bad()</script><b>粗体</b></p>')
+    mime.setHtml(
+        '<p onclick="bad()" style="font-weight:bold;background-image:url(file:///secret)">'
+        "安全内容<script>bad()</script><b>粗体</b>"
+        '<img src="file:///C:/Users/example/secret.png">'
+        '<a href="https://example.invalid">链接</a></p>'
+    )
     cursor = editor.textCursor()
     cursor.movePosition(QTextCursor.MoveOperation.End)
     editor.setTextCursor(cursor)
     editor.insertFromMimeData(mime)
-    assert "安全内容粗体" in editor.toPlainText()
+    assert "安全内容粗体链接" in editor.toPlainText()
     assert "bad()" not in editor.toPlainText()
+    assert "file:///" not in editor.toHtml()
+    assert "https://example.invalid" not in editor.toHtml()
     editor.close()
 
 
@@ -258,3 +268,39 @@ def test_editor_page_break_survives_model_mapping_and_forces_new_page(qapp) -> N
     assert any(isinstance(block, PageBreak) for block in restored.sections[0].blocks)
     assert editor.page_count >= 2
     editor.close()
+
+
+def test_editor_preserves_run_sources_sections_and_visual_zoom(qapp) -> None:
+    first_source = SourceReference(0, (10, 20, 80, 34), "第一节", "SourceFont", 0.9)
+    second_source = SourceReference(1, (10, 20, 80, 34), "第二节", "SourceFont", 0.8)
+    document = FlowDocument.new()
+    document.sections = [
+        Section(blocks=[Paragraph(runs=[TextRun("第一节", source_ref=first_source)])]),
+        Section(blocks=[Paragraph(runs=[TextRun("第二节", source_ref=second_source)])]),
+    ]
+    view = DocumentEditorView()
+    view.set_document(document)
+    editor = view.editor
+    first_block = editor.document().begin()
+    before_height = editor.document().documentLayout().blockBoundingRect(first_block).height()
+    before_page_width = editor.document().pageSize().width()
+
+    editor.set_zoom_factor(1.4)
+    after_height = editor.document().documentLayout().blockBoundingRect(first_block).height()
+    restored = editor.flow_document()
+
+    assert editor.zoom_factor == 1.4
+    assert view.editor_canvas.transform().m11() == 1.4
+    assert after_height == before_height
+    assert (
+        abs(before_page_width * view.editor_canvas.transform().m11() - 1.4 * before_page_width)
+        < 0.01
+    )
+    assert len(restored.sections) == 2
+    assert restored.sections[0].blocks[0].runs[0].source_ref == first_source
+    assert restored.sections[1].blocks[0].runs[0].source_ref == second_source
+    assert restored.plain_text == document.plain_text
+    editor.actual_size()
+    assert editor.zoom_factor == 1.0
+    assert view.editor_canvas.transform().m11() == 1.0
+    view.close()

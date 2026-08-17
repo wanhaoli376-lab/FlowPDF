@@ -14,17 +14,17 @@ if (-not (Test-Path -LiteralPath $buildPython -PathType Leaf)) {
 
 $pythonVersion = & $buildPython -c "import platform; print(platform.python_version())"
 if ($LASTEXITCODE -ne 0 -or $pythonVersion.Trim() -ne "3.14.5") {
-    throw "正式构建固定使用 Python 3.14.5 x64；当前构建环境为 $pythonVersion。"
+    throw "Release builds require Python 3.14.5 x64; found $pythonVersion."
 }
 
 & $buildPython -m pip install --requirement requirements-build.txt
-if ($LASTEXITCODE -ne 0) { throw "安装固定构建依赖失败。" }
+if ($LASTEXITCODE -ne 0) { throw "Installing pinned build dependencies failed." }
 
 & $buildPython scripts\generate_icon.py build\generated\flowpdf.ico
-if ($LASTEXITCODE -ne 0) { throw "生成 Windows 图标失败。" }
+if ($LASTEXITCODE -ne 0) { throw "Generating the Windows icon failed." }
 
 & $buildPython -m PyInstaller --clean --noconfirm FlowPDF.spec
-if ($LASTEXITCODE -ne 0) { throw "PyInstaller 构建失败。" }
+if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed." }
 
 $distribution = Join-Path $projectRoot "dist\FlowPDF"
 Copy-Item -LiteralPath (Join-Path $projectRoot "README.md") -Destination $distribution
@@ -33,5 +33,5 @@ Copy-Item -LiteralPath (Join-Path $projectRoot "BUILD_REPORT.md") -Destination $
 Copy-Item -LiteralPath (Join-Path $projectRoot "MANUAL_DOCUMENT_MODE_TEST.md") -Destination $distribution
 Copy-Item -LiteralPath (Join-Path $projectRoot "LICENSES") -Destination $distribution -Recurse
 
-Write-Host "构建完成：$projectRoot\dist\FlowPDF\FlowPDF.exe"
-Write-Host "该测试构建未进行代码签名，Windows 可能显示未知发布者提示。"
+Write-Host "Build complete: $projectRoot\dist\FlowPDF\FlowPDF.exe"
+Write-Host "This test build is unsigned; Windows may show an unknown publisher warning."

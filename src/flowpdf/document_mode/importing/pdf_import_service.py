@@ -8,7 +8,7 @@ from pathlib import Path
 import pymupdf
 
 from flowpdf.backends.base import PdfResourceLimits
-from flowpdf.backends.pymupdf_runtime import serialized_pymupdf
+from flowpdf.backends.pymupdf_runtime import PYMUPDF_LOCK
 from flowpdf.document_mode.importing.complexity_scorer import score_import
 from flowpdf.document_mode.importing.extracted import ExtractedLine
 from flowpdf.document_mode.importing.font_resolver import ImportFontResolver
@@ -60,7 +60,6 @@ class PdfImportService:
         self._limits = limits or PdfResourceLimits()
         self._extractor = extractor or TextExtractor()
 
-    @serialized_pymupdf
     def import_file(
         self,
         path: str | Path,
@@ -81,18 +80,21 @@ class PdfImportService:
             if source_size <= 0 or source_size > self._limits.max_source_bytes:
                 raise PdfImportError("PDF 文件为空或超过导入安全大小上限")
             report_progress(2, "正在安全打开 PDF")
-            document = pymupdf.open(resolved)
-            if document.needs_pass:
-                if password is None:
-                    raise ImportPasswordRequired("此 PDF 需要密码")
-                if not document.authenticate(password):
-                    raise ImportInvalidPassword("PDF 密码不正确")
-            self._validate_document(document)
-            pages = self._extractor.extract(
-                document,
-                cancel_check=cancel,
-                progress=report_progress,
-            )
+            with PYMUPDF_LOCK:
+                document = pymupdf.open(resolved)
+                if document.needs_pass:
+                    if password is None:
+                        raise ImportPasswordRequired("此 PDF 需要密码")
+                    if not document.authenticate(password):
+                        raise ImportInvalidPassword("PDF 密码不正确")
+                self._validate_document(document)
+                pages = self._extractor.extract(
+                    document,
+                    cancel_check=cancel,
+                    progress=report_progress,
+                )
+                document.close()
+                document = None
             if cancel():
                 raise ImportCancelled
             headers, footers, page_numbers = detect_headers_and_footers(pages)
@@ -152,7 +154,8 @@ class PdfImportService:
             raise PdfImportError("无法导入 PDF，文件可能损坏、受限制或资源异常") from exc
         finally:
             if document is not None:
-                document.close()
+                with PYMUPDF_LOCK:
+                    document.close()
 
     def _validate_document(self, document: pymupdf.Document) -> None:
         if document.page_count <= 0 or document.page_count > self._limits.max_pages:

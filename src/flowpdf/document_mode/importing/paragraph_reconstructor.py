@@ -87,12 +87,15 @@ class ParagraphReconstructor:
                         ),
                     )
                 )
-        text = "".join(run.text for run in runs)
+        original_text = "".join(run.text for run in runs)
         x0 = min(line.bbox[0] for line in lines)
         y0 = min(line.bbox[1] for line in lines)
         x1 = max(line.bbox[2] for line in lines)
         y1 = max(line.bbox[3] for line in lines)
-        list_match = _LIST_ITEM.match(text)
+        list_match = _LIST_ITEM.match(original_text)
+        if list_match:
+            self._remove_run_prefix(runs, list_match.end())
+        text = "".join(run.text for run in runs)
         paragraph = Paragraph(
             runs=runs,
             style=ParagraphStyle(
@@ -111,7 +114,7 @@ class ParagraphReconstructor:
             source_ref=SourceReference(
                 page_index=lines[0].page_index,
                 bbox=(x0, y0, x1, y1),
-                original_text=text,
+                original_text=original_text,
                 original_font=lines[0].dominant_font,
                 confidence=0.88,
             ),
@@ -137,6 +140,16 @@ class ParagraphReconstructor:
     @staticmethod
     def _remove_consumed_prefix(text: str, runs: list[TextRun]) -> str:
         return text
+
+    @staticmethod
+    def _remove_run_prefix(runs: list[TextRun], length: int) -> None:
+        remaining = length
+        for run in runs:
+            if remaining <= 0:
+                break
+            consumed = min(len(run.text), remaining)
+            run.text = run.text[consumed:]
+            remaining -= consumed
 
 
 def _color_hex(color: int) -> str:

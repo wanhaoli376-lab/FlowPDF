@@ -39,7 +39,10 @@ _ROLE_PROPERTY = int(QTextFormat.Property.UserProperty) + 101
 _SOURCE_PROPERTY = int(QTextFormat.Property.UserProperty) + 102
 _IMAGE_ALT_PROPERTY = int(QTextFormat.Property.UserProperty) + 103
 _PAGE_BREAK_PROPERTY = int(QTextFormat.Property.UserProperty) + 104
+_RUN_SOURCE_PROPERTY = int(QTextFormat.Property.UserProperty) + 105
+_SECTION_PROPERTY = int(QTextFormat.Property.UserProperty) + 106
 _ASSET_SCHEME = "flowpdf-asset"
+BASE_FONT_SIZE_PT = 11.0
 
 
 class DocumentMapper:
@@ -53,41 +56,50 @@ class DocumentMapper:
         geometry = PageGeometry.from_setup(source.page_setup)
         target.setUndoRedoEnabled(False)
         target.clear()
+        default_font = target.defaultFont()
+        default_font.setPointSizeF(BASE_FONT_SIZE_PT)
+        target.setDefaultFont(default_font)
         target.setDocumentMargin(0.0)
         target.setPageSize(QSizeF(geometry.content_width_px, geometry.content_height_px))
         self._install_resources(target, source)
         cursor = QTextCursor(target)
         first = True
-        for section in source.sections:
+        for section_index, section in enumerate(source.sections):
             for block in section.blocks:
                 if not first:
                     cursor.insertBlock()
                 first = False
                 if isinstance(block, Paragraph):
-                    self._insert_paragraph(cursor, block, geometry)
+                    self._insert_paragraph(cursor, block, geometry, section_index)
                 elif isinstance(block, PageBreak):
-                    self._insert_page_break(cursor)
+                    self._insert_page_break(cursor, section_index)
                 else:
-                    self._insert_image(cursor, block, geometry)
+                    self._insert_image(cursor, block, geometry, section_index)
         if first:
-            self._apply_block_format(cursor, Paragraph(), geometry)
+            self._apply_block_format(cursor, Paragraph(), geometry, 0)
         target.setUndoRedoEnabled(True)
         target.clearUndoRedoStacks()
         return geometry
 
     def to_model(self, source: QTextDocument) -> FlowDocument:
         document = copy.deepcopy(self._template)
-        blocks: list[Paragraph | BlockImage | PageBreak] = []
+        sections: list[Section] = []
+        current_section: int | None = None
         block = source.begin()
         while block.isValid():
+            section_value = block.blockFormat().property(_SECTION_PROPERTY)
+            section_index = int(section_value) if section_value is not None else 0
+            if current_section != section_index:
+                sections.append(Section())
+                current_section = section_index
             if block.blockFormat().boolProperty(_PAGE_BREAK_PROPERTY):
-                blocks.append(PageBreak())
+                sections[-1].blocks.append(PageBreak())
                 block = block.next()
                 continue
             image = self._block_image(block)
-            blocks.append(image if image is not None else self._paragraph(block))
+            sections[-1].blocks.append(image if image is not None else self._paragraph(block))
             block = block.next()
-        document.sections = [Section(blocks=blocks)]
+        document.sections = sections or [Section()]
         document.normalize()
         return document
 
@@ -121,10 +133,11 @@ class DocumentMapper:
         cursor: QTextCursor,
         paragraph: Paragraph,
         geometry: PageGeometry,
+        section_index: int,
     ) -> None:
-        self._apply_block_format(cursor, paragraph, geometry)
+        self._apply_block_format(cursor, paragraph, geometry, section_index)
         for run in paragraph.runs:
-            cursor.insertText(run.text, _char_format(run.style))
+            cursor.insertText(run.text, _char_format(run.style, run.source_ref))
         if paragraph.style.list_kind is not None:
             list_format = QTextListFormat()
             list_format.setStyle(
@@ -140,9 +153,11 @@ class DocumentMapper:
         cursor: QTextCursor,
         paragraph: Paragraph,
         geometry: PageGeometry,
+        section_index: int,
     ) -> None:
         block_format = _block_format(paragraph.style, geometry)
         block_format.setProperty(_ROLE_PROPERTY, paragraph.semantic_role.value)
+        block_format.setProperty(_SECTION_PROPERTY, section_index)
         if paragraph.source_ref is not None:
             block_format.setProperty(
                 _SOURCE_PROPERTY,
@@ -151,9 +166,10 @@ class DocumentMapper:
         cursor.setBlockFormat(block_format)
 
     @staticmethod
-    def _insert_page_break(cursor: QTextCursor) -> None:
+    def _insert_page_break(cursor: QTextCursor, section_index: int) -> None:
         block_format = QTextBlockFormat()
         block_format.setProperty(_PAGE_BREAK_PROPERTY, True)
+        block_format.setProperty(_SECTION_PROPERTY, section_index)
         block_format.setPageBreakPolicy(QTextFormat.PageBreakFlag.PageBreak_AlwaysBefore)
         cursor.setBlockFormat(block_format)
 
@@ -162,9 +178,11 @@ class DocumentMapper:
         cursor: QTextCursor,
         image: BlockImage,
         geometry: PageGeometry,
+        section_index: int,
     ) -> None:
         block_format = QTextBlockFormat()
         block_format.setAlignment(_qt_alignment(image.alignment))
+        block_format.setProperty(_SECTION_PROPERTY, section_index)
         if image.source_ref is not None:
             block_format.setProperty(
                 _SOURCE_PROPERTY,
@@ -184,7 +202,14 @@ class DocumentMapper:
         while not iterator.atEnd():
             fragment = iterator.fragment()
             if fragment.isValid() and fragment.text() and fragment.text() != "\ufffc":
-                runs.append(TextRun(fragment.text(), _text_style(fragment.charFormat())))
+                char_format = fragment.charFormat()
+                runs.append(
+                    TextRun(
+                        fragment.text(),
+                        _text_style(char_format),
+                        _source_reference(char_format.property(_RUN_SOURCE_PROPERTY)),
+                    )
+                )
             iterator += 1
         block_format = block.blockFormat()
         role_value = block_format.property(_ROLE_PROPERTY)
@@ -222,7 +247,10 @@ class DocumentMapper:
         return None
 
 
-def _char_format(style: TextStyle) -> QTextCharFormat:
+def _char_format(
+    style: TextStyle,
+    source_ref: SourceReference | None = None,
+) -> QTextCharFormat:
     value = QTextCharFormat()
     value.setFontFamilies([style.font_family])
     value.setFontPointSize(style.font_size_pt)
@@ -237,6 +265,11 @@ def _char_format(style: TextStyle) -> QTextCharFormat:
         value.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignSuperScript)
     elif style.subscript:
         value.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignSubScript)
+    if source_ref is not None:
+        value.setProperty(
+            _RUN_SOURCE_PROPERTY,
+            json.dumps(asdict(source_ref), ensure_ascii=False),
+        )
     return value
 
 
@@ -247,7 +280,7 @@ def _text_style(value: QTextCharFormat) -> TextStyle:
     has_background = value.background().style() is not Qt.BrushStyle.NoBrush
     return TextStyle(
         font_family=family or "Microsoft YaHei",
-        font_size_pt=value.fontPointSize() if value.fontPointSize() > 0 else 11.0,
+        font_size_pt=value.fontPointSize() if value.fontPointSize() > 0 else BASE_FONT_SIZE_PT,
         bold=value.fontWeight() >= QFont.Weight.Bold,
         italic=value.fontItalic(),
         underline=value.fontUnderline(),

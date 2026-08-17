@@ -161,6 +161,28 @@ def test_project_reader_reports_incompatible_version(tmp_path) -> None:
         ProjectReader().load(output)
 
 
+def test_project_reader_reports_incompatible_document_model_version(tmp_path) -> None:
+    output = tmp_path / "未来文档模型.flowpdfproj"
+    manifest = {
+        "format": "FlowPDF Project",
+        "format_version": 1,
+        "created_with": "FlowPDF",
+        "source_pdf_path": "",
+        "source_pdf_sha256": "",
+        "document_file": "document.json",
+        "assets_directory": "assets",
+        "state": {},
+    }
+    document = DocumentSerializer.to_dict(FlowDocument.new())
+    document["format_version"] = 999
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.writestr("manifest.json", json.dumps(manifest))
+        archive.writestr("document.json", json.dumps(document))
+
+    with pytest.raises(ProjectError, match="版本不兼容"):
+        ProjectReader().load(output)
+
+
 def test_project_reader_reports_truncated_zip(tmp_path) -> None:
     output = tmp_path / "截断工程.flowpdfproj"
     output.write_bytes(b"PK\x03\x04truncated")
