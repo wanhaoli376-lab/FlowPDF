@@ -27,3 +27,10 @@ def test_recent_files_drop_missing_entries(tmp_path) -> None:
     recent.add(existing)
 
     assert recent.paths() == [existing.resolve()]
+
+
+def test_recent_files_treat_qsettings_invalid_value_as_empty(tmp_path) -> None:
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    settings.setValue("recent/files", None)
+
+    assert RecentFiles(settings).paths() == []

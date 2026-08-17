@@ -28,6 +28,9 @@ from PySide6.QtWidgets import (
 )
 
 from flowpdf.backends.base import AnnotationInfo, PageInfo
+from flowpdf.document_mode.importing import ImportReport
+from flowpdf.document_mode.models import FlowDocument
+from flowpdf.document_mode.ui import DocumentEditorView, DocumentToolbar
 from flowpdf.editing.tools import ToolMode
 from flowpdf.i18n import tr
 from flowpdf.rendering.render_scheduler import RenderScheduler, RenderSource
@@ -49,6 +52,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.scheduler = scheduler
         self.controller: Any | None = None
+        self.document_mode_controller: Any | None = None
+        self.lifecycle_controller: Any | None = None
+        self.active_mode = "welcome"
         self._page_count = 0
         self._closing = False
         self.setObjectName("mainWindow")
@@ -60,8 +66,10 @@ class MainWindow(QMainWindow):
         self._workspace = QStackedWidget(self)
         self._welcome = WelcomePage(self._workspace)
         self.document_view = DocumentView(scheduler, self._workspace)
+        self.document_editor_view = DocumentEditorView(self._workspace)
         self._workspace.addWidget(self._welcome)
         self._workspace.addWidget(self.document_view)
+        self._workspace.addWidget(self.document_editor_view)
         self.setCentralWidget(self._workspace)
 
         self._create_actions()
@@ -73,9 +81,13 @@ class MainWindow(QMainWindow):
         self._create_status_bar()
         self._connect_view_controls()
         self.set_document_enabled(False)
+        self._apply_mode_ui()
 
     def attach_controller(self, controller: Any) -> None:
         self.controller = controller
+
+    def attach_document_mode_controller(self, controller: Any) -> None:
+        self.document_mode_controller = controller
 
     def show_document(
         self,
@@ -93,6 +105,8 @@ class MainWindow(QMainWindow):
         self.page_spin.setRange(1, max(1, self._page_count))
         self.page_spin.setValue(1)
         self._workspace.setCurrentWidget(self.document_view)
+        self.active_mode = "layout"
+        self._apply_mode_ui()
         self.setWindowTitle(f"{title} — FlowPDF")
         self.set_document_enabled(True)
         self._update_page_status(0)
@@ -118,10 +132,61 @@ class MainWindow(QMainWindow):
         self.annotation_panel.clear()
         self.search_panel.set_results(0, 0)
         self._page_count = 0
-        self._workspace.setCurrentWidget(self._welcome)
-        self.setWindowTitle("FlowPDF")
-        self.page_status.setText(tr("MainWindow", "未打开文档"))
+        if self.active_mode != "document":
+            self.active_mode = "welcome"
+            self._workspace.setCurrentWidget(self._welcome)
+            self.setWindowTitle("FlowPDF")
+            self.page_status.setText(tr("MainWindow", "未打开文档"))
+            self._apply_mode_ui()
         self.set_document_enabled(False)
+
+    def show_document_editor(
+        self,
+        document: FlowDocument,
+        report: ImportReport | None = None,
+    ) -> None:
+        self.document_editor_view.set_document(document, report)
+        self._workspace.setCurrentWidget(self.document_editor_view)
+        self.active_mode = "document"
+        self.set_document_enabled(False)
+        self.document_editor_view.editor.setEnabled(True)
+        self.document_editor_view.editor.setFocus()
+        self.set_document_mode_enabled(True)
+        self._apply_mode_ui()
+        self._set_document_navigation(document)
+        self.set_import_report(report)
+        self.mode_status.setText("文档编辑模式")
+        self.update_document_word_count(len(document.plain_text.replace("\n", "")))
+        self.update_document_mode_status(
+            self.document_editor_view.current_page,
+            self.document_editor_view.editor.page_count,
+        )
+
+    def clear_document_editor(self) -> None:
+        self.document_editor_view.clear_document()
+        if self.active_mode == "document":
+            self.active_mode = "welcome"
+            self._workspace.setCurrentWidget(self._welcome)
+            self.setWindowTitle("FlowPDF")
+            self.page_status.setText(tr("MainWindow", "未打开文档"))
+            self.mode_status.setText("")
+            self.word_status.setText("")
+            self._apply_mode_ui()
+
+    def update_document_mode_status(self, page_index: int, page_count: int) -> None:
+        if self.active_mode != "document":
+            return
+        count = max(1, page_count)
+        page = min(max(0, page_index), count - 1)
+        self.page_status.setText(f"第 {page + 1} 页，共 {count} 页")
+        self.total_pages_label.setText(f"/ {count}")
+        if self.document_page_list.count() != count:
+            self.document_page_list.clear()
+            self.document_page_list.addItems([f"第 {index + 1} 页" for index in range(count)])
+        self.document_page_list.setCurrentRow(page)
+
+    def update_document_word_count(self, count: int) -> None:
+        self.word_status.setText(f"字符 {max(0, count)}")
 
     def selected_pages(self) -> list[int]:
         pages = self.thumbnail_panel.selected_pages()
@@ -154,6 +219,33 @@ class MainWindow(QMainWindow):
         self.page_spin.setEnabled(enabled)
         if not enabled:
             self.document_view.set_tool(ToolMode.SELECT)
+
+    def set_document_mode_enabled(self, enabled: bool) -> None:
+        for action in (
+            self.save_action,
+            self.save_as_action,
+            self.close_action,
+            self.search_action,
+            self.zoom_in_action,
+            self.zoom_out_action,
+            self.actual_size_action,
+        ):
+            action.setEnabled(enabled)
+        self.document_toolbar.setEnabled(enabled)
+
+    def set_import_report(self, report: ImportReport | None) -> None:
+        if report is None:
+            self.import_report_label.setText("从工程文件打开，未重新分析来源 PDF。")
+            return
+        details = [
+            f"质量评分：{report.score}/100",
+            f"检测栏数：{report.detected_columns}",
+            f"段落：{report.paragraph_count}",
+            f"标题：{report.heading_count}",
+        ]
+        if report.warnings:
+            details.append("\n".join(f"• {warning}" for warning in report.warnings[:5]))
+        self.import_report_label.setText("\n".join(details))
 
     def set_busy(self, busy: bool, message: str = "") -> None:
         self.progress_bar.setVisible(busy)
@@ -204,7 +296,10 @@ class MainWindow(QMainWindow):
 
     def hide_search(self) -> None:
         self.search_toolbar.hide()
-        self.document_view.setFocus()
+        if self.active_mode == "document":
+            self.document_editor_view.editor.setFocus()
+        else:
+            self.document_view.setFocus()
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if _first_pdf_path(event.mimeData()) is not None:
@@ -224,7 +319,8 @@ class MainWindow(QMainWindow):
         if self._closing:
             event.accept()
             return
-        if self.controller is not None and not self.controller.request_close():
+        lifecycle = self.lifecycle_controller or self.document_mode_controller or self.controller
+        if lifecycle is not None and not lifecycle.request_close():
             event.ignore()
             return
         self._closing = True
@@ -244,10 +340,20 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, title, message)
 
     def _create_actions(self) -> None:
+        self.document_mode_action = QAction("文档编辑", self)
+        self.layout_mode_action = QAction("版面编辑", self)
+        self.document_mode_action.setCheckable(True)
+        self.layout_mode_action.setCheckable(True)
+        self.mode_group = QActionGroup(self)
+        self.mode_group.setExclusive(True)
+        self.mode_group.addAction(self.document_mode_action)
+        self.mode_group.addAction(self.layout_mode_action)
+
         self.open_action = QAction(tr("MainWindow", "打开"), self)
         self.open_action.setShortcut(QKeySequence.StandardKey.Open)
         self.new_action = QAction(tr("MainWindow", "新建空白 PDF"), self)
         self.new_action.setShortcut(QKeySequence.StandardKey.New)
+        self.open_project_action = QAction("打开 FlowPDF 工程…", self)
         self.save_action = QAction(tr("MainWindow", "保存"), self)
         self.save_action.setShortcut(QKeySequence.StandardKey.Save)
         self.save_as_action = QAction(tr("MainWindow", "另存为副本"), self)
@@ -325,7 +431,7 @@ class MainWindow(QMainWindow):
 
     def _create_menus(self) -> None:
         file_menu = self.menuBar().addMenu(tr("MainWindow", "文件"))
-        file_menu.addActions([self.new_action, self.open_action])
+        file_menu.addActions([self.new_action, self.open_action, self.open_project_action])
         self.recent_menu = file_menu.addMenu(tr("MainWindow", "最近打开"))
         file_menu.addSeparator()
         file_menu.addActions([self.save_action, self.save_as_action, self.close_action])
@@ -385,17 +491,25 @@ class MainWindow(QMainWindow):
         self.view_menu.addAction(self.cache_settings_action)
 
     def _create_toolbar(self) -> None:
-        toolbar = QToolBar(tr("MainWindow", "常用工具"), self)
-        toolbar.setObjectName("mainToolbar")
-        toolbar.setMovable(False)
-        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        toolbar.addActions([self.open_action, self.save_action])
-        toolbar.addSeparator()
-        toolbar.addActions([self.undo_action, self.redo_action])
-        toolbar.addSeparator()
-        toolbar.addActions([self.search_action, self.zoom_out_action, self.zoom_in_action])
-        toolbar.addSeparator()
-        toolbar.addActions(
+        self.mode_toolbar = QToolBar("编辑模式", self)
+        self.mode_toolbar.setObjectName("modeToolbar")
+        self.mode_toolbar.setMovable(False)
+        self.mode_toolbar.addActions([self.document_mode_action, self.layout_mode_action])
+        self.addToolBar(self.mode_toolbar)
+
+        self.layout_toolbar = QToolBar(tr("MainWindow", "常用工具"), self)
+        self.layout_toolbar.setObjectName("mainToolbar")
+        self.layout_toolbar.setMovable(False)
+        self.layout_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.layout_toolbar.addActions([self.open_action, self.save_action])
+        self.layout_toolbar.addSeparator()
+        self.layout_toolbar.addActions([self.undo_action, self.redo_action])
+        self.layout_toolbar.addSeparator()
+        self.layout_toolbar.addActions(
+            [self.search_action, self.zoom_out_action, self.zoom_in_action]
+        )
+        self.layout_toolbar.addSeparator()
+        self.layout_toolbar.addActions(
             [
                 self.tool_actions[ToolMode.SELECT],
                 self.tool_actions[ToolMode.ADD_TEXT],
@@ -404,15 +518,20 @@ class MainWindow(QMainWindow):
                 self.tool_actions[ToolMode.PERMANENT_DELETE],
             ]
         )
-        toolbar.addSeparator()
-        toolbar.addWidget(QLabel("页码", toolbar))
-        self.page_spin = QSpinBox(toolbar)
+        self.layout_toolbar.addSeparator()
+        self.layout_toolbar.addWidget(QLabel("页码", self.layout_toolbar))
+        self.page_spin = QSpinBox(self.layout_toolbar)
         self.page_spin.setRange(1, 1)
         self.page_spin.setFixedWidth(72)
-        toolbar.addWidget(self.page_spin)
-        self.total_pages_label = QLabel("/ 0", toolbar)
-        toolbar.addWidget(self.total_pages_label)
-        self.addToolBar(toolbar)
+        self.layout_toolbar.addWidget(self.page_spin)
+        self.total_pages_label = QLabel("/ 0", self.layout_toolbar)
+        self.layout_toolbar.addWidget(self.total_pages_label)
+        self.addToolBar(self.layout_toolbar)
+
+        self.document_toolbar = DocumentToolbar(self)
+        self.document_toolbar.bind(self.document_editor_view.editor)
+        self.addToolBar(self.document_toolbar)
+        self.document_toolbar.hide()
 
     def _create_search_bar(self) -> None:
         self.search_toolbar = QToolBar("搜索栏", self)
@@ -428,14 +547,28 @@ class MainWindow(QMainWindow):
         dock = QDockWidget(tr("MainWindow", "导航"), self)
         dock.setObjectName("navigationDock")
         dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea)
-        tabs = QTabWidget(dock)
-        tabs.setDocumentMode(True)
-        self.thumbnail_panel = ThumbnailPanel(self.scheduler, tabs)
-        tabs.addTab(self.thumbnail_panel, tr("MainWindow", "页面"))
-        tabs.addTab(QListWidget(tabs), tr("MainWindow", "书签"))
-        self.annotation_panel = AnnotationPanel(tabs)
-        tabs.addTab(self.annotation_panel, tr("MainWindow", "批注"))
-        dock.setWidget(tabs)
+        self.navigation_tabs = QTabWidget(dock)
+        self.navigation_tabs.setDocumentMode(True)
+        self.thumbnail_panel = ThumbnailPanel(self.scheduler, self.navigation_tabs)
+        self.layout_pages_tab = self.navigation_tabs.addTab(
+            self.thumbnail_panel, tr("MainWindow", "页面")
+        )
+        self.bookmark_list = QListWidget(self.navigation_tabs)
+        self.bookmarks_tab = self.navigation_tabs.addTab(
+            self.bookmark_list, tr("MainWindow", "书签")
+        )
+        self.annotation_panel = AnnotationPanel(self.navigation_tabs)
+        self.annotations_tab = self.navigation_tabs.addTab(
+            self.annotation_panel, tr("MainWindow", "批注")
+        )
+        self.document_page_list = QListWidget(self.navigation_tabs)
+        self.document_pages_tab = self.navigation_tabs.addTab(self.document_page_list, "文档页")
+        self.document_outline_list = QListWidget(self.navigation_tabs)
+        self.document_outline_tab = self.navigation_tabs.addTab(
+            self.document_outline_list, "文档结构"
+        )
+        self.document_page_list.currentRowChanged.connect(self.document_editor_view.jump_to_page)
+        dock.setWidget(self.navigation_tabs)
         dock.setMinimumWidth(190)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
 
@@ -443,19 +576,32 @@ class MainWindow(QMainWindow):
         dock = QDockWidget(tr("MainWindow", "属性"), self)
         dock.setObjectName("propertiesDock")
         dock.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea)
-        body = QWidget(dock)
-        layout = QVBoxLayout(body)
-        hint = QLabel(tr("MainWindow", "选择页面或对象后，这里会显示可用属性。"), body)
+        self.properties_stack = QStackedWidget(dock)
+        layout_body = QWidget(self.properties_stack)
+        layout = QVBoxLayout(layout_body)
+        hint = QLabel(tr("MainWindow", "选择页面或对象后，这里会显示可用属性。"), layout_body)
         hint.setWordWrap(True)
         hint.setAlignment(Qt.AlignmentFlag.AlignTop)
         layout.addWidget(hint)
         layout.addStretch(1)
-        dock.setWidget(body)
+        document_body = QWidget(self.properties_stack)
+        document_layout = QVBoxLayout(document_body)
+        document_layout.addWidget(QLabel("导入诊断", document_body))
+        self.import_report_label = QLabel(document_body)
+        self.import_report_label.setWordWrap(True)
+        self.import_report_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        document_layout.addWidget(self.import_report_label)
+        document_layout.addStretch(1)
+        self.properties_stack.addWidget(layout_body)
+        self.properties_stack.addWidget(document_body)
+        dock.setWidget(self.properties_stack)
         dock.setMinimumWidth(220)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
 
     def _create_status_bar(self) -> None:
         self.page_status = QLabel(tr("MainWindow", "未打开文档"), self)
+        self.word_status = QLabel("", self)
+        self.mode_status = QLabel("", self)
         self.zoom_status = QLabel("100%", self)
         self.save_status = QLabel(tr("MainWindow", "原文件将受到保护"), self)
         self.progress_bar = QProgressBar(self)
@@ -463,9 +609,11 @@ class MainWindow(QMainWindow):
         self.progress_bar.setTextVisible(False)
         self.progress_bar.hide()
         self.statusBar().addWidget(self.page_status)
+        self.statusBar().addWidget(self.word_status)
         self.statusBar().addPermanentWidget(self.progress_bar)
         self.statusBar().addPermanentWidget(self.zoom_status)
         self.statusBar().addPermanentWidget(self.save_status)
+        self.statusBar().addPermanentWidget(self.mode_status)
 
     def _connect_view_controls(self) -> None:
         self._welcome.open_requested.connect(self.open_action.trigger)
@@ -495,6 +643,37 @@ class MainWindow(QMainWindow):
         )
         self.dark_theme_action.triggered.connect(
             lambda _checked=False: self.theme_requested.emit("dark")
+        )
+
+    def _set_document_navigation(self, document: FlowDocument) -> None:
+        self.document_outline_list.clear()
+        for section in document.sections:
+            for block in section.blocks:
+                role = getattr(block, "semantic_role", None)
+                if role is None or role.value not in {"title", "heading1", "heading2", "heading3"}:
+                    continue
+                text = getattr(block, "text", "").strip()
+                if text:
+                    self.document_outline_list.addItem(text[:80])
+
+    def _apply_mode_ui(self) -> None:
+        is_document = self.active_mode == "document"
+        is_layout = self.active_mode == "layout"
+        self.document_toolbar.setVisible(is_document)
+        self.layout_toolbar.setVisible(not is_document)
+        self.document_mode_action.setChecked(is_document)
+        self.layout_mode_action.setChecked(is_layout)
+        self.page_menu.setEnabled(not is_document)
+        self.annotation_menu.setEnabled(not is_document)
+        self.signature_menu.setEnabled(not is_document)
+        self.navigation_tabs.setTabVisible(self.layout_pages_tab, not is_document)
+        self.navigation_tabs.setTabVisible(self.bookmarks_tab, not is_document)
+        self.navigation_tabs.setTabVisible(self.annotations_tab, not is_document)
+        self.navigation_tabs.setTabVisible(self.document_pages_tab, is_document)
+        self.navigation_tabs.setTabVisible(self.document_outline_tab, is_document)
+        self.properties_stack.setCurrentIndex(1 if is_document else 0)
+        self.mode_status.setText(
+            "文档编辑模式" if is_document else "版面编辑模式" if is_layout else ""
         )
 
     def _update_page_status(self, page_index: int) -> None:

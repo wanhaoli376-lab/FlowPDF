@@ -29,6 +29,8 @@ class RecentFiles:
 
     def _stored_paths(self) -> list[Path]:
         value = self.settings.value("recent/files", [])
+        if value is None:
+            return []
         if isinstance(value, str):
             value = [value]
         return [Path(str(item)) for item in value]

@@ -62,6 +62,7 @@ class DocumentController(QObject):
         backend_factory: Callable[[], PdfBackend],
         save_service: SafeSaveService | None = None,
         task_service: TaskService | None = None,
+        connect_global_actions: bool = True,
     ) -> None:
         super().__init__(window)
         self.window = window
@@ -76,6 +77,7 @@ class DocumentController(QObject):
         self._search_handle: TaskHandle | None = None
         self._shutdown = False
         self._close_when_idle = False
+        self._connect_global_actions = connect_global_actions
         self._autosave = QTimer(self)
         self._autosave.setInterval(15_000)
         self._autosave.timeout.connect(self._flush_recovery)
@@ -800,15 +802,16 @@ class DocumentController(QObject):
 
     def _connect_actions(self) -> None:
         window = self.window
-        window.open_action.triggered.connect(lambda _checked=False: self.open_dialog())
-        window.new_action.triggered.connect(lambda _checked=False: self.create_new())
-        window.save_action.triggered.connect(lambda _checked=False: self.save())
-        window.save_as_action.triggered.connect(lambda _checked=False: self.save(save_as=True))
-        window.close_action.triggered.connect(lambda _checked=False: self.close_document())
-        window.undo_action.triggered.connect(lambda _checked=False: self.undo())
-        window.redo_action.triggered.connect(lambda _checked=False: self.redo())
-        window.pdf_dropped.connect(self.open_path)
-        window.recent_file_requested.connect(self.open_path)
+        if self._connect_global_actions:
+            window.open_action.triggered.connect(lambda _checked=False: self.open_dialog())
+            window.new_action.triggered.connect(lambda _checked=False: self.create_new())
+            window.save_action.triggered.connect(lambda _checked=False: self.save())
+            window.save_as_action.triggered.connect(lambda _checked=False: self.save(save_as=True))
+            window.close_action.triggered.connect(lambda _checked=False: self.close_document())
+            window.undo_action.triggered.connect(lambda _checked=False: self.undo())
+            window.redo_action.triggered.connect(lambda _checked=False: self.redo())
+            window.pdf_dropped.connect(self.open_path)
+            window.recent_file_requested.connect(self.open_path)
         window.search_panel.search_requested.connect(self.search)
         window.search_panel.previous_requested.connect(self.previous_search_result)
         window.search_panel.next_requested.connect(self.next_search_result)

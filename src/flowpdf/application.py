@@ -11,6 +11,8 @@ from PySide6.QtWidgets import QApplication, QInputDialog
 
 from flowpdf.backends.pymupdf_backend import PyMuPdfBackend
 from flowpdf.document_controller import DocumentController
+from flowpdf.document_mode.editing.document_controller import DocumentModeController
+from flowpdf.mode_coordinator import ModeCoordinator
 from flowpdf.rendering.render_scheduler import RenderScheduler
 from flowpdf.services.recent_files import RecentFiles
 from flowpdf.services.recovery_service import RecoveryService
@@ -47,7 +49,8 @@ def create_application(
 
     settings = SettingsService()
     root = _application_data_root(data_root)
-    TempFileService(root / "temp").cleanup()
+    temp_files = TempFileService(root / "temp")
+    temp_files.cleanup()
     save_artifacts = SaveArtifactRegistry(root / "pending-saves.json")
     save_artifacts.cleanup()
     scheduler = RenderScheduler(max_cache_bytes=settings.cache_limit_mb * 1024 * 1024)
@@ -59,8 +62,21 @@ def create_application(
         recent_files=RecentFiles(settings.settings),
         backend_factory=lambda: PyMuPdfBackend(artifact_registry=save_artifacts),
         save_service=SafeSaveService(save_artifacts),
+        connect_global_actions=False,
     )
     window.controller = controller
+    document_mode_controller = DocumentModeController(
+        window,
+        artifact_registry=save_artifacts,
+    )
+    window.attach_document_mode_controller(document_mode_controller)
+    mode_coordinator = ModeCoordinator(
+        window,
+        controller,
+        document_mode_controller,
+        temp_files=temp_files,
+    )
+    window.lifecycle_controller = mode_coordinator
     window.theme_requested.connect(lambda value: _set_theme(app, window, settings, value))
     window.cache_settings_action.triggered.connect(
         lambda _checked=False: _configure_cache(window, scheduler, settings)
@@ -70,8 +86,8 @@ def create_application(
     arguments = list(argv or [])
     if len(arguments) > 1:
         candidate = Path(arguments[1])
-        if candidate.suffix.casefold() == ".pdf":
-            QTimer.singleShot(0, lambda: controller.open_path(candidate))
+        if candidate.suffix.casefold() in {".pdf", ".flowpdfproj"}:
+            QTimer.singleShot(0, lambda: mode_coordinator.open_path(candidate))
     return app, window
 
 
