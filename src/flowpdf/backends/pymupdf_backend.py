@@ -767,7 +767,13 @@ class PyMuPdfBackend(PdfBackend):
         if not text:
             raise PdfEditError("文字内容不能为空")
         self._validate_opacity(style.opacity)
-        font = self._font_resolver.resolve(style.font_family, text=text)
+        font = self._font_resolver.resolve_compatible(
+            style.font_family,
+            text=text,
+            supports_text=self._font_supports_text,
+        )
+        if not self._font_supports_text(font.path, text):
+            raise PdfEditError("本机没有可显示输入文字的字体，请选择支持这些字符的字体")
         font_name = "helv"
         font_file: str | None = None
         if font.path is not None:
@@ -802,6 +808,23 @@ class PyMuPdfBackend(PdfBackend):
             font_name=font_name,
             font_file=font_file,
         )
+
+    @staticmethod
+    def _font_supports_text(path: Path | None, text: str) -> bool:
+        try:
+            font = (
+                pymupdf.Font(fontfile=str(path))
+                if path is not None
+                else pymupdf.Font(fontname="helv")
+            )
+            return all(
+                not character.isprintable()
+                or character.isspace()
+                or font.has_glyph(ord(character)) > 0
+                for character in text
+            )
+        except (RuntimeError, ValueError, OSError, pymupdf.mupdf.FzErrorBase):
+            return False
 
     def _preflight_text(self, prepared: _PreparedText, style: TextStyle) -> _PreparedText:
         candidate = prepared

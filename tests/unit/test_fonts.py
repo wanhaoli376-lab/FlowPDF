@@ -28,3 +28,22 @@ def test_existing_font_matching_ignores_case_and_pdf_subset_prefix() -> None:
     assert result.family == "Arial"
     assert result.replaced is False
     assert result.path.name == "arial.ttf"
+
+
+def test_existing_font_without_required_glyphs_uses_compatible_fallback() -> None:
+    resolver = FontResolver(
+        {
+            "Arial": Path("C:/Windows/Fonts/arial.ttf"),
+            "Microsoft YaHei": Path("C:/Windows/Fonts/msyh.ttc"),
+        }
+    )
+
+    result = resolver.resolve_compatible(
+        "Arial",
+        text="编辑",
+        supports_text=lambda path, _text: path.name == "msyh.ttc",
+    )
+
+    assert result.family == "Microsoft YaHei"
+    assert result.path == Path("C:/Windows/Fonts/msyh.ttc")
+    assert result.replaced is True

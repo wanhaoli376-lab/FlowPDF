@@ -18,6 +18,7 @@ from flowpdf.backends.base import (
 from flowpdf.backends.pymupdf_backend import PyMuPdfBackend
 from flowpdf.editing.text_editor import OverflowStrategy
 from flowpdf.utils.coordinates import Rect
+from flowpdf.utils.fonts import FontResolver
 
 
 @pytest.fixture
@@ -168,6 +169,76 @@ def test_chinese_text_can_remove_one_character_and_remain_searchable(pdfs, tmp_p
     reopened.open_document(output)
     assert reopened.search_text(replacement)
     assert reopened.search_text(span.text) == []
+
+
+def test_chinese_replacement_falls_back_when_requested_font_has_no_cjk_glyphs(
+    tmp_path,
+) -> None:
+    output = tmp_path / "中文字体覆盖.pdf"
+    backend = PyMuPdfBackend()
+    backend.create_document()
+    target = Rect(72, 72, 240, 120)
+
+    backend.add_text(
+        0,
+        target,
+        "Original",
+        TextStyle(font_family="Helvetica", font_size=14),
+    )
+    backend.replace_text(
+        0,
+        target,
+        "责任",
+        TextStyle(
+            font_family="Arial",
+            font_size=14,
+            overflow=OverflowStrategy.AUTO_SHRINK,
+        ),
+    )
+    backend.save_document(output)
+    backend.close_document()
+
+    reopened = PyMuPdfBackend()
+    reopened.open_document(output)
+    assert reopened.search_text("Original") == []
+    assert reopened.search_text("责任")
+    span = next(span for span in reopened.extract_text_spans(0) if span.text == "责任")
+    assert "Arial" not in span.font_family
+    reopened.close_document()
+
+
+def test_replacement_keeps_old_text_when_no_font_can_display_new_text(tmp_path) -> None:
+    source = tmp_path / "font-preflight-source.pdf"
+    target = Rect(72, 72, 240, 120)
+    creator = PyMuPdfBackend()
+    creator.create_document()
+    creator.add_text(
+        0,
+        target,
+        "Original",
+        TextStyle(font_family="Helvetica", font_size=14),
+    )
+    creator.save_document(source)
+    creator.close_document()
+
+    backend = PyMuPdfBackend(
+        font_resolver=FontResolver({"Unavailable": tmp_path / "not-a-font.ttf"})
+    )
+    backend.open_document(source)
+    revision = backend.revision
+
+    with pytest.raises(PdfEditError, match="没有可显示输入文字的字体"):
+        backend.replace_text(
+            0,
+            target,
+            "责任",
+            TextStyle(font_family="Unavailable", font_size=14),
+        )
+
+    assert backend.revision == revision
+    assert backend.search_text("Original")
+    assert backend.search_text("责任") == []
+    backend.close_document()
 
 
 def test_small_existing_text_can_be_edited_below_six_points(tmp_path) -> None:

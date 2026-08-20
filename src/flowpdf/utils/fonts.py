@@ -44,10 +44,19 @@ class FontResolver:
         self._warning_handler = warning_handler
 
     def resolve(self, requested_family: str | None, *, text: str = "") -> FontResolution:
+        return self.resolve_compatible(requested_family, text=text)
+
+    def resolve_compatible(
+        self,
+        requested_family: str | None,
+        *,
+        text: str = "",
+        supports_text: Callable[[Path, str], bool] | None = None,
+    ) -> FontResolution:
         requested = requested_family or ""
         normalized = self._normalize(requested)
         match = self._fonts.get(normalized)
-        if match is not None:
+        if match is not None and self._is_compatible(match, text, supports_text):
             return FontResolution(requested, match[0], match[1], False)
 
         fallback_names = self._cjk_fallbacks if contains_cjk(text) else self._latin_fallbacks
@@ -56,17 +65,37 @@ class FontResolver:
                 self._fonts[self._normalize(name)]
                 for name in fallback_names
                 if self._normalize(name) in self._fonts
+                and self._is_compatible(
+                    self._fonts[self._normalize(name)],
+                    text,
+                    supports_text,
+                )
             ),
             None,
         )
-        if fallback is None and self._fonts:
-            fallback = next(iter(self._fonts.values()))
+        if fallback is None:
+            fallback = next(
+                (
+                    candidate
+                    for candidate in self._fonts.values()
+                    if self._is_compatible(candidate, text, supports_text)
+                ),
+                None,
+            )
         family, path = fallback if fallback is not None else ("Helvetica", None)
         resolution = FontResolution(requested, family, path, True)
         if self._warning_handler is not None:
             shown = requested or "未指定字体"
             self._warning_handler(f"字体“{shown}”不可用，已替换为“{family}”。")
         return resolution
+
+    @staticmethod
+    def _is_compatible(
+        candidate: tuple[str, Path],
+        text: str,
+        supports_text: Callable[[Path, str], bool] | None,
+    ) -> bool:
+        return supports_text is None or not text or supports_text(candidate[1], text)
 
     @classmethod
     def discover_system_fonts(cls) -> dict[str, Path]:
