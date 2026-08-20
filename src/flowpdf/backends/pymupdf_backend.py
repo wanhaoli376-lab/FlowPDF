@@ -7,6 +7,7 @@ import os
 import uuid
 import warnings
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from typing import Protocol
@@ -37,7 +38,7 @@ from flowpdf.backends.base import (
     TextStyle,
 )
 from flowpdf.backends.pymupdf_runtime import serialized_pymupdf
-from flowpdf.editing.text_editor import layout_text
+from flowpdf.editing.text_editor import OverflowStrategy, layout_text
 from flowpdf.utils.coordinates import Point, Rect
 from flowpdf.utils.fonts import FontResolver
 
@@ -60,6 +61,16 @@ _ANNOTATION_TYPE_MAP = {
     "square": AnnotationKind.RECTANGLE,
     "circle": AnnotationKind.ELLIPSE,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedText:
+    text: str
+    lines: tuple[str, ...]
+    font_size: float
+    target: pymupdf.Rect
+    font_name: str
+    font_file: str | None
 
 
 class ArtifactRegistry(Protocol):
@@ -294,80 +305,45 @@ class PyMuPdfBackend(PdfBackend):
 
     @serialized_pymupdf
     def add_text(self, page_index: int, rect: Rect, text: str, style: TextStyle) -> Rect:
-        if not text:
-            raise PdfEditError("文字内容不能为空")
-        self._validate_opacity(style.opacity)
         with self._lock:
             self._require_editable()
             self._ensure_object_capacity(64)
             page = self._page(page_index)
-            font = self._font_resolver.resolve(style.font_family, text=text)
-            font_name = "helv"
-            font_file: str | None = None
-            if font.path is not None:
-                digest = hashlib.sha1(str(font.path).encode()).hexdigest()[:10]
-                font_name = f"FP{digest}"
-                font_file = str(font.path)
-                metric_font = pymupdf.Font(fontfile=font_file)
-                measure = metric_font.text_length
-            else:
-
-                def measure(value: str, size: float) -> float:
-                    return pymupdf.get_text_length(value, fontname=font_name, fontsize=size)
-
-            layout = layout_text(
-                text,
-                rect,
-                font_size=style.font_size,
-                strategy=style.overflow,
-                measure=measure,
-            )
-            target = _fitz_rect(layout.rect) & page.rect
-            if target.is_empty:
-                raise PdfEditError("文字框不在页面内")
-            if style.background_color is not None:
-                page.draw_rect(
-                    target,
-                    color=None,
-                    fill=style.background_color,
-                    fill_opacity=style.opacity,
-                    overlay=True,
-                )
-            remaining = page.insert_textbox(
-                target,
-                "\n".join(layout.lines),
-                fontsize=layout.font_size,
-                fontname=font_name,
-                fontfile=font_file,
-                color=style.color,
-                align=max(0, min(2, style.alignment)),
-                lineheight=1.0,
-                fill_opacity=style.opacity,
-                stroke_opacity=style.opacity,
-                overlay=True,
-            )
-            if remaining < -0.01:
-                raise PdfEditError("文字仍超出文本框，请扩大区域或缩小字号")
-            if style.underline:
-                underline_y = min(target.y1 - 1, target.y0 + layout.font_size * 1.1)
-                page.draw_line(
-                    pymupdf.Point(target.x0, underline_y),
-                    pymupdf.Point(target.x1, underline_y),
-                    color=style.color,
-                    width=max(0.5, layout.font_size / 14),
-                    stroke_opacity=style.opacity,
-                    overlay=True,
-                )
+            prepared = self._prepare_text(page, rect, text, style)
+            prepared = self._preflight_text(prepared, style)
+            self._insert_prepared_text(page, prepared, style)
             self._revision += 1
-            return _rect(target)
+            return _rect(prepared.target)
 
     @serialized_pymupdf
     def replace_text(self, page_index: int, rect: Rect, text: str, style: TextStyle) -> Rect:
         with self._lock:
             self._require_editable()
-            self._redact(page_index, rect, images=0, graphics=0, fill=False)
-            result = self.add_text(page_index, rect, text, style)
-            return result
+            page = self._page(page_index)
+            prepared: _PreparedText | None = None
+            target = _fitz_rect(rect) & page.rect
+            if text:
+                prepared = self._prepare_text(page, rect, text, style)
+                prepared = self._preflight_text(prepared, style)
+                target = prepared.target
+            before = self.document_bytes()
+            revision = self._revision
+            try:
+                self._redact(page_index, rect, images=0, graphics=0, fill=False)
+                if prepared is not None:
+                    self._insert_prepared_text(page, prepared, style)
+            except Exception:
+                try:
+                    self.load_bytes(before)
+                    self._revision = revision
+                except Exception as rollback_error:
+                    raise PdfEditError(
+                        "文字替换失败，且无法恢复修改前状态；请关闭文件并重新打开"
+                    ) from rollback_error
+                raise
+            if prepared is None:
+                return _rect(target)
+            return _rect(prepared.target)
 
     @serialized_pymupdf
     def add_image(self, page_index: int, rect: Rect, image_path: str | Path) -> None:
@@ -780,6 +756,155 @@ class PyMuPdfBackend(PdfBackend):
                 for info in page.get_image_info()
             )
             return image_area / page_area >= 0.4
+
+    def _prepare_text(
+        self,
+        page: pymupdf.Page,
+        rect: Rect,
+        text: str,
+        style: TextStyle,
+    ) -> _PreparedText:
+        if not text:
+            raise PdfEditError("文字内容不能为空")
+        self._validate_opacity(style.opacity)
+        font = self._font_resolver.resolve(style.font_family, text=text)
+        font_name = "helv"
+        font_file: str | None = None
+        if font.path is not None:
+            digest = hashlib.sha1(str(font.path).encode()).hexdigest()[:10]
+            font_name = f"FP{digest}"
+            font_file = str(font.path)
+            metric_font = pymupdf.Font(fontfile=font_file)
+            measure = metric_font.text_length
+        else:
+
+            def measure(value: str, size: float) -> float:
+                return pymupdf.get_text_length(value, fontname=font_name, fontsize=size)
+
+        layout = layout_text(
+            text,
+            rect,
+            font_size=style.font_size,
+            strategy=style.overflow,
+            min_font_size=4.0,
+            measure=measure,
+        )
+        target = _fitz_rect(layout.rect) & page.rect
+        if target.is_empty:
+            raise PdfEditError("文字框不在页面内")
+        if layout.overflow:
+            raise PdfEditError("文字仍超出文本框，请扩大区域或缩小字号")
+        return _PreparedText(
+            text=text,
+            lines=layout.lines,
+            font_size=layout.font_size,
+            target=target,
+            font_name=font_name,
+            font_file=font_file,
+        )
+
+    def _preflight_text(self, prepared: _PreparedText, style: TextStyle) -> _PreparedText:
+        candidate = prepared
+        while True:
+            scratch = pymupdf.open()
+            try:
+                page = scratch.new_page(
+                    width=max(1.0, candidate.target.width),
+                    height=max(1.0, candidate.target.height),
+                )
+                local = _PreparedText(
+                    text=candidate.text,
+                    lines=candidate.lines,
+                    font_size=candidate.font_size,
+                    target=page.rect,
+                    font_name=candidate.font_name,
+                    font_file=candidate.font_file,
+                )
+                self._insert_prepared_text(page, local, style)
+                return candidate
+            except PdfEditError:
+                if style.overflow is not OverflowStrategy.AUTO_SHRINK or candidate.font_size <= 4.0:
+                    raise
+                candidate = self._relayout_prepared_text(
+                    prepared,
+                    max(4.0, round(candidate.font_size - 0.5, 2)),
+                )
+            finally:
+                scratch.close()
+
+    @staticmethod
+    def _relayout_prepared_text(prepared: _PreparedText, font_size: float) -> _PreparedText:
+        if prepared.font_file is not None:
+            metric_font = pymupdf.Font(fontfile=prepared.font_file)
+            measure = metric_font.text_length
+        else:
+
+            def measure(value: str, size: float) -> float:
+                return pymupdf.get_text_length(
+                    value,
+                    fontname=prepared.font_name,
+                    fontsize=size,
+                )
+
+        layout = layout_text(
+            prepared.text,
+            _rect(prepared.target),
+            font_size=font_size,
+            strategy=OverflowStrategy.AUTO_SHRINK,
+            min_font_size=4.0,
+            measure=measure,
+        )
+        if layout.overflow:
+            raise PdfEditError("文字仍超出文本框，请扩大区域或缩小字号")
+        return _PreparedText(
+            text=prepared.text,
+            lines=layout.lines,
+            font_size=layout.font_size,
+            target=prepared.target,
+            font_name=prepared.font_name,
+            font_file=prepared.font_file,
+        )
+
+    @staticmethod
+    def _insert_prepared_text(
+        page: pymupdf.Page,
+        prepared: _PreparedText,
+        style: TextStyle,
+    ) -> None:
+        target = prepared.target
+        if style.background_color is not None:
+            page.draw_rect(
+                target,
+                color=None,
+                fill=style.background_color,
+                fill_opacity=style.opacity,
+                overlay=True,
+            )
+        remaining = page.insert_textbox(
+            target,
+            "\n".join(prepared.lines),
+            fontsize=prepared.font_size,
+            fontname=prepared.font_name,
+            fontfile=prepared.font_file,
+            color=style.color,
+            align=max(0, min(2, style.alignment)),
+            lineheight=1.0,
+            fill_opacity=style.opacity,
+            stroke_opacity=style.opacity,
+            overlay=True,
+        )
+        if remaining < -0.01:
+            raise PdfEditError("文字仍超出文本框，请扩大区域或缩小字号")
+        if style.underline:
+            underline_y = min(target.y1 - 1, target.y0 + prepared.font_size * 1.1)
+            page.draw_line(
+                pymupdf.Point(target.x0, underline_y),
+                pymupdf.Point(target.x1, underline_y),
+                color=style.color,
+                width=max(0.5, prepared.font_size / 14),
+                stroke_opacity=style.opacity,
+                overlay=True,
+            )
 
     def _redact(
         self,

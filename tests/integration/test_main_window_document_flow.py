@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 
+import pytest
 from PIL import Image
 from PySide6.QtCore import QEventLoop, QTimer
-from PySide6.QtWidgets import QInputDialog
+from PySide6.QtWidgets import QDialog, QInputDialog
 from tests.generate_test_pdfs import generate_test_pdfs
 
 from flowpdf.application import create_application
@@ -13,7 +14,7 @@ from flowpdf.backends.pymupdf_backend import PyMuPdfBackend
 from flowpdf.editing.document_session import DocumentSession
 from flowpdf.editing.pdf_commands import PdfCommandType
 from flowpdf.services.recovery_service import RecoveryService
-from flowpdf.utils.coordinates import Rect
+from flowpdf.utils.coordinates import Point, Rect
 
 
 def _wait_until(predicate, timeout_ms: int = 5000) -> bool:
@@ -194,6 +195,92 @@ def test_editing_tools_share_history_and_persist_real_pdf_content(tmp_path, qapp
 
     window.close()
     assert window.controller.is_shutdown
+
+
+def test_existing_text_dialog_can_delete_the_entire_text_span(tmp_path, qapp, monkeypatch) -> None:
+    pdfs = generate_test_pdfs(tmp_path / "fixtures", include_stress=False)
+    _app, window = create_application(["flowpdf-test"], data_root=tmp_path / "app-data")
+    window.show()
+    window.controller.open_path(pdfs["normal"])
+    assert _wait_until(lambda: window.controller.session is not None)
+    span = next(
+        item
+        for item in window.controller.session.backend.extract_text_spans(0)
+        if item.text == "Searchable content"
+    )
+
+    class EmptyTextDialog:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def text_and_style(self):
+            return "", TextStyle()
+
+    monkeypatch.setattr("flowpdf.document_controller.TextEditDialog", EmptyTextDialog)
+    window.document_view.point_double_clicked.emit(
+        0,
+        Point((span.rect.x0 + span.rect.x1) / 2, (span.rect.y0 + span.rect.y1) / 2),
+    )
+
+    assert _wait_until(
+        lambda: window.controller.session.backend.search_text("Searchable content") == []
+    )
+    window.controller.undo()
+    assert _wait_until(
+        lambda: bool(window.controller.session.backend.search_text("Searchable content"))
+    )
+    assert window.controller.close_document(discard=True)
+    window.close()
+
+
+@pytest.mark.parametrize("replacement", ["Searchable conten", "Searchable contenX"])
+def test_existing_text_dialog_can_edit_one_character_with_safe_defaults(
+    tmp_path, qapp, monkeypatch, replacement
+) -> None:
+    pdfs = generate_test_pdfs(tmp_path / "fixtures", include_stress=False)
+    _app, window = create_application(["flowpdf-test"], data_root=tmp_path / "app-data")
+    errors: list[tuple[str, str]] = []
+    window.show_error = lambda title, message: errors.append((title, message))
+    window.show()
+    window.controller.open_path(pdfs["normal"])
+    assert _wait_until(lambda: window.controller.session is not None)
+    span = next(
+        item
+        for item in window.controller.session.backend.extract_text_spans(0)
+        if item.text == "Searchable content"
+    )
+
+    class OneCharacterEditDialog:
+        def __init__(self, *, text, style, **_kwargs) -> None:
+            self._style = style
+            assert text == "Searchable content"
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def text_and_style(self):
+            return replacement, self._style
+
+    monkeypatch.setattr("flowpdf.document_controller.TextEditDialog", OneCharacterEditDialog)
+    window.document_view.point_double_clicked.emit(
+        0,
+        Point((span.rect.x0 + span.rect.x1) / 2, (span.rect.y0 + span.rect.y1) / 2),
+    )
+
+    assert _wait_until(
+        lambda: (
+            bool(errors)
+            or window.controller.session.backend.search_text("Searchable content") == []
+        )
+    )
+    assert errors == []
+    assert window.controller.session.backend.search_text(replacement)
+    assert window.controller.session.backend.search_text("Searchable content") == []
+    assert window.controller.close_document(discard=True)
+    window.close()
 
 
 def test_controller_recovers_command_log_without_overwriting_source(tmp_path, qapp) -> None:

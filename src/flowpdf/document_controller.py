@@ -23,6 +23,7 @@ from flowpdf.backends.base import (
 )
 from flowpdf.editing.document_session import DocumentSession
 from flowpdf.editing.pdf_commands import PdfCommandType
+from flowpdf.editing.text_editor import OverflowStrategy
 from flowpdf.editing.tools import ToolMode
 from flowpdf.rendering.render_scheduler import RenderSource
 from flowpdf.services.recent_files import RecentFiles
@@ -786,8 +787,7 @@ class DocumentController(QObject):
             )
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 text, style = dialog.text_and_style()
-                if text:
-                    self.replace_text(page_index, span.rect, text, style)
+                self.replace_text(page_index, span.rect, text, style)
 
         self.tasks.submit(locate, on_success=selected, on_error=self._show_task_error)
 
@@ -885,6 +885,7 @@ def _style_from_span(span: TextSpan) -> TextStyle:
             ((color >> 8) & 0xFF) / 255,
             (color & 0xFF) / 255,
         ),
+        overflow=OverflowStrategy.AUTO_SHRINK,
     )
 
 

@@ -8,6 +8,7 @@ from tests.generate_test_pdfs import generate_test_pdfs
 from flowpdf.backends.base import (
     AnnotationKind,
     AnnotationSpec,
+    PdfEditError,
     PdfPermissionError,
     PdfResourceLimitError,
     PdfResourceLimits,
@@ -15,6 +16,7 @@ from flowpdf.backends.base import (
     TextStyle,
 )
 from flowpdf.backends.pymupdf_backend import PyMuPdfBackend
+from flowpdf.editing.text_editor import OverflowStrategy
 from flowpdf.utils.coordinates import Rect
 
 
@@ -63,6 +65,135 @@ def test_replace_text_permanently_removes_old_searchable_content(pdfs, tmp_path)
     assert reopened.search_text("2025") == []
     assert reopened.search_text("2026")
     assert "2025" not in "".join(span.text for span in reopened.extract_text_spans(0))
+
+
+def test_failed_text_replacement_does_not_delete_the_original(pdfs) -> None:
+    backend = PyMuPdfBackend()
+    backend.open_document(pdfs["normal"])
+    span = next(span for span in backend.extract_text_spans(0) if span.text == "Searchable content")
+
+    with pytest.raises(PdfEditError, match="超出文本框"):
+        backend.replace_text(
+            0,
+            span.rect,
+            "This replacement is deliberately far too long for the original text box",
+            TextStyle(
+                font_family=span.font_family,
+                font_size=span.font_size,
+                overflow=OverflowStrategy.WARN,
+            ),
+        )
+
+    assert backend.search_text("Searchable content")
+
+
+def test_live_text_insertion_failure_rolls_back_the_redaction(pdfs, monkeypatch) -> None:
+    backend = PyMuPdfBackend()
+    backend.open_document(pdfs["normal"])
+    span = next(span for span in backend.extract_text_spans(0) if span.text == "Searchable content")
+    original_revision = backend.revision
+    original_insert = PyMuPdfBackend._insert_prepared_text
+    original_redact = backend._redact
+    redaction_applied = False
+
+    def track_redaction(*args, **kwargs) -> None:
+        nonlocal redaction_applied
+        original_redact(*args, **kwargs)
+        redaction_applied = True
+
+    def fail_on_live_page(page, prepared, style) -> None:
+        if redaction_applied:
+            raise PdfEditError("模拟真实页面写入失败")
+        original_insert(page, prepared, style)
+
+    monkeypatch.setattr(backend, "_redact", track_redaction)
+    monkeypatch.setattr(
+        PyMuPdfBackend,
+        "_insert_prepared_text",
+        staticmethod(fail_on_live_page),
+    )
+
+    with pytest.raises(PdfEditError, match="模拟真实页面写入失败"):
+        backend.replace_text(
+            0,
+            span.rect,
+            "Searchable contenX",
+            TextStyle(
+                font_family=span.font_family,
+                font_size=span.font_size,
+                overflow=OverflowStrategy.AUTO_SHRINK,
+            ),
+        )
+
+    assert backend.search_text("Searchable content")
+    assert backend.revision == original_revision
+
+
+def test_replacing_text_with_an_empty_value_deletes_the_original(pdfs, tmp_path) -> None:
+    output = tmp_path / "deleted-text.pdf"
+    backend = PyMuPdfBackend()
+    backend.open_document(pdfs["normal"])
+    span = next(span for span in backend.extract_text_spans(0) if span.text == "Searchable content")
+
+    backend.replace_text(0, span.rect, "", TextStyle())
+    backend.save_document(output)
+    backend.close_document()
+
+    reopened = PyMuPdfBackend()
+    reopened.open_document(output)
+    assert reopened.search_text("Searchable content") == []
+
+
+def test_chinese_text_can_remove_one_character_and_remain_searchable(pdfs, tmp_path) -> None:
+    output = tmp_path / "中文删字.pdf"
+    backend = PyMuPdfBackend()
+    backend.open_document(pdfs["chinese"])
+    span = next(span for span in backend.extract_text_spans(0) if "本地编辑" in span.text)
+    replacement = span.text[:-1]
+
+    backend.replace_text(
+        0,
+        span.rect,
+        replacement,
+        TextStyle(
+            font_family=span.font_family,
+            font_size=span.font_size,
+            overflow=OverflowStrategy.AUTO_SHRINK,
+        ),
+    )
+    backend.save_document(output)
+    backend.close_document()
+
+    reopened = PyMuPdfBackend()
+    reopened.open_document(output)
+    assert reopened.search_text(replacement)
+    assert reopened.search_text(span.text) == []
+
+
+def test_small_existing_text_can_be_edited_below_six_points(tmp_path) -> None:
+    source = tmp_path / "small-text.pdf"
+    document = pymupdf.open()
+    page = document.new_page(width=300, height=200)
+    page.insert_text((40, 60), "Tiny text", fontsize=5)
+    document.ez_save(source)
+    document.close()
+    backend = PyMuPdfBackend()
+    backend.open_document(source)
+    span = next(span for span in backend.extract_text_spans(0) if span.text == "Tiny text")
+
+    backend.replace_text(
+        0,
+        span.rect,
+        "Tiny tex",
+        TextStyle(
+            font_family=span.font_family,
+            font_size=span.font_size,
+            overflow=OverflowStrategy.AUTO_SHRINK,
+        ),
+    )
+
+    assert backend.search_text("Tiny text") == []
+    assert backend.search_text("Tiny tex")
 
 
 def test_permanent_delete_removes_text_image_and_vector_content(tmp_path) -> None:
