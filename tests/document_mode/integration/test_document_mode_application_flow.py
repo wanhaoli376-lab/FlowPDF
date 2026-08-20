@@ -412,3 +412,26 @@ def test_document_page_navigation_debounces_live_thumbnails(qapp, tmp_path) -> N
     assert _wait_until(qapp, lambda: window.document_editor_view.current_page == 1)
     window.document_mode_controller.close_document(discard=True)
     window.close()
+
+
+def test_clearing_document_mode_cancels_delayed_pagination_and_keeps_pages_empty(
+    qapp, tmp_path
+) -> None:
+    _app, window = create_application(["flowpdf-test"], data_root=tmp_path / "app-data")
+    document = FlowDocument.new()
+    document.append_block(Paragraph(runs=[TextRun("关闭前的长文档内容。" * 500)]))
+    window.show_document_editor(document)
+    window.show()
+    assert _wait_until(qapp, lambda: window.document_page_list.count() > 1)
+
+    window.document_editor_view.editor.insertPlainText("触发尚未执行的分页更新")
+    window.clear_document_editor()
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+
+    assert window.active_mode == "welcome"
+    assert window.document_page_list.count() == 0
+    assert window.page_status.text() == "未打开文档"
+    window.close()

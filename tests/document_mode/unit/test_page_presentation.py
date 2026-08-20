@@ -69,3 +69,21 @@ def test_page_presentation_returns_only_pages_intersecting_the_repaint_area() ->
     )
 
     assert visible == (500,)
+
+
+def test_page_presentation_maps_viewport_centers_and_clamps_page_gaps() -> None:
+    presentation = PagePresentation(
+        PageGeometry.from_setup(PageSetup()),
+        page_count=3,
+        page_gap_px=30,
+    )
+    first = presentation.paper_rect(0)
+    second = presentation.paper_rect(1)
+
+    assert presentation.page_for_visual_y(first.center().y()) == 0
+    assert presentation.page_for_visual_y(second.center().y()) == 1
+    assert presentation.page_for_visual_y(presentation.visual_size.height() + 100) == 2
+
+    gap_point = QPointF(first.center().x(), first.bottom() + 24)
+    clamped = presentation.visual_to_document_clamped(gap_point)
+    assert presentation.page_for_document_y(clamped.y()) == 1

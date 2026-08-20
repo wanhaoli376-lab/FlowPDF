@@ -3,8 +3,19 @@ from __future__ import annotations
 import io
 
 from PIL import Image
-from PySide6.QtCore import QMimeData, QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt
-from PySide6.QtGui import QInputMethodEvent, QTextCursor, QWheelEvent
+from PySide6.QtCore import (
+    QCoreApplication,
+    QEvent,
+    QMimeData,
+    QPoint,
+    QPointF,
+    QRect,
+    QRectF,
+    QSize,
+    QSizeF,
+    Qt,
+)
+from PySide6.QtGui import QInputMethodEvent, QTextCursor, QTextFormat, QWheelEvent
 from PySide6.QtTest import QTest
 
 from flowpdf.document_mode.editing import PaginatedTextEdit
@@ -265,9 +276,15 @@ def test_editor_page_break_survives_model_mapping_and_forces_new_page(qapp) -> N
     editor.insert_page_break()
     editor.insertPlainText("第二页内容")
     restored = editor.flow_document()
+    snapshot = editor.pagination_snapshot()
+    trailing = editor.document().lastBlock()
 
     assert any(isinstance(block, PageBreak) for block in restored.sections[0].blocks)
-    assert editor.page_count >= 2
+    assert snapshot.page_count == 2
+    assert snapshot.block_pages[-1] == 1
+    assert not (
+        trailing.blockFormat().pageBreakPolicy() & QTextFormat.PageBreakFlag.PageBreak_AlwaysBefore
+    )
     editor.close()
 
 
@@ -340,6 +357,20 @@ def test_document_editor_view_displays_separated_physical_paper(qapp) -> None:
     view.close()
 
 
+def test_deferred_canvas_updates_do_not_run_after_the_view_is_destroyed(qapp) -> None:
+    view = DocumentEditorView()
+    view.set_document(_reflow_document())
+    view.show()
+    qapp.processEvents()
+
+    view.editor_canvas._resize_proxy()
+    view.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+    # A static singleShot callback used to dereference the deleted C++ canvas here.
+    qapp.processEvents()
+
+
 def test_clicking_text_on_a_later_visual_page_places_the_document_cursor(qapp) -> None:
     document = _reflow_document()
     document.sections[0].blocks[0].runs[0].text += "跨页点击命中。" * 80
@@ -358,11 +389,12 @@ def test_clicking_text_on_a_later_visual_page_places_the_document_cursor(qapp) -
     block_rect = editor.document().documentLayout().blockBoundingRect(block)
     logical_point = QPointF(block_rect.left() + 8, block_rect.top() + 8)
     visual_point = editor.page_presentation.document_to_visual(logical_point)
+    canvas_point = view.editor_canvas.mapFromScene(visual_point)
 
     QTest.mouseClick(
-        editor.viewport(),
+        view.editor_canvas.viewport(),
         Qt.MouseButton.LeftButton,
-        pos=visual_point.toPoint(),
+        pos=canvas_point,
     )
 
     assert editor.textCursor().blockNumber() == target_block_number
@@ -393,10 +425,12 @@ def test_mouse_drag_selects_text_across_physical_page_gap(qapp) -> None:
     end = editor.page_presentation.document_to_visual(
         QPointF(target_rect.right() - 4, target_rect.top() + 8)
     )
+    canvas_start = view.editor_canvas.mapFromScene(start)
+    canvas_end = view.editor_canvas.mapFromScene(end)
 
-    QTest.mousePress(editor.viewport(), Qt.MouseButton.LeftButton, pos=start.toPoint())
-    QTest.mouseMove(editor.viewport(), end.toPoint())
-    QTest.mouseRelease(editor.viewport(), Qt.MouseButton.LeftButton, pos=end.toPoint())
+    QTest.mousePress(view.editor_canvas.viewport(), Qt.MouseButton.LeftButton, pos=canvas_start)
+    QTest.mouseMove(view.editor_canvas.viewport(), canvas_end)
+    QTest.mouseRelease(view.editor_canvas.viewport(), Qt.MouseButton.LeftButton, pos=canvas_end)
 
     cursor = editor.textCursor()
     assert cursor.hasSelection()
@@ -430,17 +464,52 @@ def test_double_click_selects_a_word_on_a_later_physical_page(qapp) -> None:
     visual = editor.page_presentation.document_to_visual(
         QPointF(target_rect.left() + 8, target_rect.top() + 8)
     )
+    canvas_point = view.editor_canvas.mapFromScene(visual)
     QTest.mouseDClick(
-        editor.viewport(),
+        view.editor_canvas.viewport(),
         Qt.MouseButton.LeftButton,
-        pos=visual.toPoint(),
+        pos=canvas_point,
     )
 
     assert editor.textCursor().selectedText() == "TargetWord"
     view.close()
 
 
-def test_later_page_cursor_scrolls_into_view_and_reports_visual_ime_rectangle(qapp) -> None:
+def test_triple_click_selects_the_complete_paragraph_on_the_physical_canvas(qapp) -> None:
+    document = FlowDocument.new()
+    document.append_block(Paragraph(runs=[TextRun("First paragraph has several words.")]))
+    document.append_block(Paragraph(runs=[TextRun("Second paragraph stays unselected.")]))
+    view = DocumentEditorView()
+    view.resize(720, 520)
+    view.set_document(document)
+    view.show()
+    qapp.processEvents()
+    editor = view.editor
+    first = editor.document().begin()
+    first_rect = editor.document().documentLayout().blockBoundingRect(first)
+    visual = editor.page_presentation.document_to_visual(
+        QPointF(first_rect.left() + 8, first_rect.top() + 8)
+    )
+    canvas_point = view.editor_canvas.mapFromScene(visual)
+
+    QTest.mouseDClick(
+        view.editor_canvas.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=canvas_point,
+    )
+    QTest.mouseClick(
+        view.editor_canvas.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=canvas_point,
+    )
+
+    assert editor.textCursor().selectedText() == "First paragraph has several words."
+    view.close()
+
+
+def test_later_page_cursor_scrolls_into_view_and_reports_scaled_scrolled_ime_rectangle(
+    qapp,
+) -> None:
     document = FlowDocument.new()
     document.page_setup = PageSetup(
         width_pt=260,
@@ -462,14 +531,103 @@ def test_later_page_cursor_scrolls_into_view_and_reports_visual_ime_rectangle(qa
     target = editor.document().findBlockByNumber(15)
     cursor = QTextCursor(target)
     editor.setTextCursor(cursor)
+    editor.setFocus()
     qapp.processEvents()
     snapshot = editor.pagination_snapshot()
     target_page = snapshot.block_pages[target.blockNumber()]
     candidate = editor.inputMethodQuery(Qt.InputMethodQuery.ImCursorRectangle)
+    input_method = qapp.inputMethod()
+    input_method.update(Qt.InputMethodQuery.ImCursorRectangle)
+    qapp.processEvents()
+    initial_window_rect = QRectF(input_method.cursorRectangle())
 
     assert isinstance(candidate, (QRect, QRectF))
     assert editor.page_presentation.content_rect(target_page).contains(candidate.center())
     assert view.editor_canvas.verticalScrollBar().value() > 0
+
+    editor.set_zoom_factor(2.0)
+    qapp.processEvents()
+    input_method.update(Qt.InputMethodQuery.ImCursorRectangle)
+    qapp.processEvents()
+    zoomed_window_rect = QRectF(input_method.cursorRectangle())
+    assert zoomed_window_rect.height() >= initial_window_rect.height() * 1.8
+
+    scroll_bar = view.editor_canvas.verticalScrollBar()
+    previous_scroll = scroll_bar.value()
+    scroll_bar.setValue(min(scroll_bar.maximum(), previous_scroll + 80))
+    assert scroll_bar.value() > previous_scroll
+    input_method.update(Qt.InputMethodQuery.ImCursorRectangle)
+    qapp.processEvents()
+    scrolled_window_rect = QRectF(input_method.cursorRectangle())
+    assert scrolled_window_rect.top() < zoomed_window_rect.top() - 40
+    view.close()
+
+
+def test_scrolling_updates_visible_page_and_active_paper_without_moving_cursor(qapp) -> None:
+    document = _reflow_document()
+    document.sections[0].blocks = [Paragraph(runs=[TextRun("滚动页状态。" * 700)])]
+    view = DocumentEditorView()
+    view.resize(520, 360)
+    view.set_document(document)
+    view.show()
+    qapp.processEvents()
+    editor = view.editor
+    editor.moveCursor(QTextCursor.MoveOperation.Start)
+    assert view.current_page == 0
+
+    scroll_bar = view.editor_canvas.verticalScrollBar()
+    scroll_bar.setValue(scroll_bar.maximum())
+    qapp.processEvents()
+
+    assert view.current_page == editor.page_count - 1
+    assert editor.active_page == view.current_page
+    assert editor.textCursor().position() == 0
+    view.close()
+
+
+def test_cursor_remains_visible_after_typing_expands_the_document_to_new_pages(qapp) -> None:
+    document = _reflow_document()
+    document.sections[0].blocks = [Paragraph(runs=[TextRun("开头")])]
+    view = DocumentEditorView()
+    view.resize(520, 360)
+    view.set_document(document)
+    view.show()
+    editor = view.editor
+    editor.setFocus()
+    editor.moveCursor(QTextCursor.MoveOperation.End)
+    editor.insertPlainText("输入后持续跟随光标。" * 900)
+
+    QTest.qWait(260)
+    qapp.processEvents()
+    visual_cursor = editor.visual_cursor_rect()
+    viewport_cursor = view.editor_canvas.mapFromScene(visual_cursor.center())
+
+    assert editor.page_count > 1
+    assert view.current_page == editor.current_page
+    assert view.editor_canvas.viewport().rect().adjusted(-1, -1, 1, 1).contains(viewport_cursor)
+    view.close()
+
+
+def test_cursor_movement_uses_cached_pagination_instead_of_rescanning_all_blocks(
+    qapp, monkeypatch
+) -> None:
+    document = FlowDocument.new()
+    for index in range(300):
+        document.append_block(Paragraph(runs=[TextRun(f"第 {index} 段。")]))
+    view = DocumentEditorView()
+    view.set_document(document)
+    calls = 0
+    original = view.editor.pagination_snapshot
+
+    def tracked_snapshot():
+        nonlocal calls
+        calls += 1
+        return original()
+
+    monkeypatch.setattr(view.editor, "pagination_snapshot", tracked_snapshot)
+    view.editor.moveCursor(QTextCursor.MoveOperation.End)
+
+    assert calls == 0
     view.close()
 
 
@@ -576,4 +734,35 @@ def test_mouse_wheel_scrolls_pages_and_ctrl_wheel_zooms(qapp) -> None:
     )
     assert qapp.sendEvent(editor.viewport(), zoom_event)
     assert editor.zoom_factor > before_zoom
+    view.close()
+
+
+def test_dragging_selection_at_viewport_edge_auto_scrolls_across_pages(qapp) -> None:
+    document = _reflow_document()
+    document.sections[0].blocks = [Paragraph(runs=[TextRun("跨页边缘拖选内容。" * 900)])]
+    view = DocumentEditorView()
+    view.resize(520, 360)
+    view.set_document(document)
+    view.show()
+    qapp.processEvents()
+    editor = view.editor
+    canvas = view.editor_canvas
+    first_rect = editor.document().documentLayout().blockBoundingRect(editor.document().begin())
+    visual_start = editor.page_presentation.document_to_visual(
+        QPointF(first_rect.left() + 4, first_rect.top() + 4)
+    )
+    viewport_start = canvas.mapFromScene(visual_start)
+    viewport_end = QPoint(viewport_start.x(), canvas.viewport().height() - 3)
+    scroll_bar = canvas.verticalScrollBar()
+    before_scroll = scroll_bar.value()
+
+    QTest.mousePress(canvas.viewport(), Qt.MouseButton.LeftButton, pos=viewport_start)
+    QTest.mouseMove(canvas.viewport(), viewport_end, delay=10)
+    QTest.qWait(320)
+    qapp.processEvents()
+    QTest.mouseRelease(canvas.viewport(), Qt.MouseButton.LeftButton, pos=viewport_end)
+
+    assert scroll_bar.value() > before_scroll
+    assert editor.textCursor().hasSelection()
+    assert editor.textCursor().selectionEnd() > 100
     view.close()

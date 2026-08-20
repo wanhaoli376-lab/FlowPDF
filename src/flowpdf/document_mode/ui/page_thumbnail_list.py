@@ -14,10 +14,14 @@ class DocumentPageList(QListWidget):
         super().__init__(parent)
         self._editor = editor
         self._rendered_pages: set[int] = set()
+        self._pending_pages: list[int] = []
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(240)
         self._refresh_timer.timeout.connect(self._refresh_visible)
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self._render_next)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setIconSize(QSize(136, 176))
         self.setSpacing(8)
@@ -35,6 +39,8 @@ class DocumentPageList(QListWidget):
         blocked = self.blockSignals(True)
         self.clear()
         self._rendered_pages.clear()
+        self._pending_pages.clear()
+        self._render_timer.stop()
         for page_index in range(selected):
             item = QListWidgetItem(f"第 {page_index + 1} 页")
             item.setData(Qt.ItemDataRole.UserRole, page_index)
@@ -59,11 +65,15 @@ class DocumentPageList(QListWidget):
 
     def clear_document(self) -> None:
         self._refresh_timer.stop()
+        self._render_timer.stop()
+        self._pending_pages.clear()
         self._rendered_pages.clear()
         self.clear()
 
     def schedule_refresh(self) -> None:
         if self.count():
+            self._render_timer.stop()
+            self._pending_pages.clear()
             self._refresh_timer.start()
 
     def viewportEvent(self, event: QEvent) -> bool:
@@ -74,9 +84,13 @@ class DocumentPageList(QListWidget):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._refresh_timer.stop()
+        self._render_timer.stop()
         super().closeEvent(event)
 
     def _sync_from_editor(self) -> None:
+        if not self._editor.has_flow_document:
+            self.clear_document()
+            return
         self.set_page_count(self._editor.page_count)
 
     def _refresh_visible(self) -> None:
@@ -94,8 +108,19 @@ class DocumentPageList(QListWidget):
         for page_index in self._rendered_pages - desired:
             if 0 <= page_index < self.count():
                 self.item(page_index).setIcon(QIcon())
-        for page_index in desired:
+        current = max(first, min(last, self.currentRow()))
+        self._pending_pages = sorted(desired, key=lambda page: (abs(page - current), page))
+        self._rendered_pages.intersection_update(desired)
+        self._render_timer.start(0)
+
+    def _render_next(self) -> None:
+        if not self._pending_pages or not self._editor.has_flow_document:
+            return
+        page_index = self._pending_pages.pop(0)
+        if 0 <= page_index < self.count() and page_index < self._editor.page_count:
             item = self.item(page_index)
             image = self._editor.render_page_thumbnail(page_index, self.iconSize())
             item.setIcon(QIcon(QPixmap.fromImage(image)))
-        self._rendered_pages = desired
+            self._rendered_pages.add(page_index)
+        if self._pending_pages:
+            self._render_timer.start(0)

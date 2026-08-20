@@ -8,7 +8,7 @@ from html.parser import HTMLParser
 from typing import ClassVar
 
 from PIL import Image, UnidentifiedImageError
-from PySide6.QtCore import QMimeData, QRectF, QSize, QSizeF, Qt, QTimer, Signal
+from PySide6.QtCore import QMimeData, QPointF, QRectF, QSize, QSizeF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAbstractTextDocumentLayout,
     QColor,
@@ -57,6 +57,8 @@ class PaginatedTextEdit(QTextEdit):
         self._geometry = PageGeometry.from_setup(FlowDocument.new().page_setup)
         self._page_count = 1
         self._presentation = PagePresentation(self._geometry, 1)
+        self._active_page = 0
+        self._document_active = False
         self._zoom_factor = 1.0
         self._pagination_timer = QTimer(self)
         self._pagination_timer.setSingleShot(True)
@@ -82,7 +84,15 @@ class PaginatedTextEdit(QTextEdit):
 
     @property
     def page_count(self) -> int:
-        return self.pagination_snapshot().page_count
+        return self._page_count
+
+    @property
+    def active_page(self) -> int:
+        return self._active_page
+
+    @property
+    def has_flow_document(self) -> bool:
+        return self._document_active
 
     @property
     def page_presentation(self) -> PagePresentation:
@@ -93,13 +103,29 @@ class PaginatedTextEdit(QTextEdit):
         return self._zoom_factor
 
     def set_flow_document(self, document: FlowDocument) -> None:
+        self._document_active = False
+        self._pagination_timer.stop()
         self.set_zoom_factor(1.0)
         self._geometry = PageGeometry.from_setup(document.page_setup)
         self._geometry = self._mapper.populate(self.document(), document)
         self._apply_zoom_geometry()
-        self._page_count = self.page_count
+        self._document_active = True
+        self._page_count = self.pagination_snapshot().page_count
         self._refresh_presentation(self._page_count)
+        self.set_active_page(0)
         self.moveCursor(QTextCursor.MoveOperation.Start)
+
+    def clear_flow_document(self) -> None:
+        self._document_active = False
+        self._pagination_timer.stop()
+        self.clear()
+        self._page_count = 1
+        self._active_page = 0
+        selected = PagePresentation(self._geometry, 1)
+        if selected != self._presentation:
+            self._presentation = selected
+            self.presentation_changed.emit()
+        self.viewport().update()
 
     def zoom_in(self) -> None:
         self.set_zoom_factor(self._zoom_factor + 0.1)
@@ -129,7 +155,7 @@ class PaginatedTextEdit(QTextEdit):
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
         painter.fillRect(event.rect(), QColor("#e5e7eb"))
         context = self._paint_context()
-        active_page = self._cursor_page()
+        active_page = self._active_page
         layout = self.document().documentLayout()
         repaint_rect = QRectF(event.rect())
         for page_index in self._presentation.page_indices_intersecting(repaint_rect):
@@ -210,6 +236,13 @@ class PaginatedTextEdit(QTextEdit):
     def current_page(self) -> int:
         return self._presentation.page_for_document_y(self.document_cursor_rect().center().y())
 
+    def set_active_page(self, page_index: int) -> None:
+        selected = max(0, min(self._presentation.page_count - 1, page_index))
+        if selected == self._active_page:
+            return
+        self._active_page = selected
+        self.viewport().update()
+
     def render_page_thumbnail(self, page_index: int, size: QSize) -> QImage:
         if not 0 <= page_index < self._presentation.page_count:
             raise IndexError("页面索引超出范围")
@@ -278,6 +311,68 @@ class PaginatedTextEdit(QTextEdit):
             event.modifiers(),
             event.pointingDevice(),
         )
+
+    def extend_selection_to_visual(self, point: QPointF, anchor: int) -> None:
+        """Extend a drag selection to a visual canvas point, including page gaps."""
+
+        position = self.text_position_at_visual(point, clamp=True)
+        if position is None:
+            return
+        document_end = max(0, self.document().characterCount() - 1)
+        cursor = QTextCursor(self.document())
+        cursor.setPosition(min(max(0, anchor), document_end))
+        cursor.setPosition(
+            min(max(0, position), document_end),
+            QTextCursor.MoveMode.KeepAnchor,
+        )
+        self.setTextCursor(cursor)
+
+    def text_position_at_visual(self, point: QPointF, *, clamp: bool = False) -> int | None:
+        logical = (
+            self._presentation.visual_to_document_clamped(point)
+            if clamp
+            else self._presentation.visual_to_document(point)
+        )
+        if logical is None:
+            return None
+        position = (
+            self.document()
+            .documentLayout()
+            .hitTest(
+                logical,
+                Qt.HitTestAccuracy.FuzzyHit,
+            )
+        )
+        document_end = max(0, self.document().characterCount() - 1)
+        return min(max(0, position), document_end)
+
+    def place_cursor_at_visual(self, point: QPointF, *, keep_anchor: bool = False) -> bool:
+        position = self.text_position_at_visual(point)
+        if position is None:
+            return False
+        cursor = self.textCursor()
+        cursor.setPosition(
+            position,
+            QTextCursor.MoveMode.KeepAnchor if keep_anchor else QTextCursor.MoveMode.MoveAnchor,
+        )
+        self.setTextCursor(cursor)
+        return True
+
+    def select_word_at_visual(self, point: QPointF) -> bool:
+        if not self.place_cursor_at_visual(point):
+            return False
+        cursor = self.textCursor()
+        cursor.select(QTextCursor.SelectionType.WordUnderCursor)
+        self.setTextCursor(cursor)
+        return True
+
+    def select_paragraph_at_visual(self, point: QPointF) -> bool:
+        if not self.place_cursor_at_visual(point):
+            return False
+        cursor = self.textCursor()
+        cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+        self.setTextCursor(cursor)
+        return True
 
     def _paint_context(self) -> QAbstractTextDocumentLayout.PaintContext:
         context = QAbstractTextDocumentLayout.PaintContext()
@@ -499,12 +594,17 @@ class PaginatedTextEdit(QTextEdit):
 
     def insert_page_break(self) -> None:
         cursor = self.textCursor()
+        cursor.beginEditBlock()
+        following = QTextBlockFormat(cursor.blockFormat())
+        following.setPageBreakPolicy(QTextFormat.PageBreakFlag.PageBreak_Auto)
+        following.clearProperty(int(QTextFormat.Property.UserProperty) + 104)
         cursor.insertBlock()
-        value = cursor.blockFormat()
-        value.setPageBreakPolicy(QTextFormat.PageBreakFlag.PageBreak_AlwaysBefore)
-        value.setProperty(int(QTextFormat.Property.UserProperty) + 104, True)
-        cursor.setBlockFormat(value)
-        cursor.insertBlock()
+        page_break = QTextBlockFormat(following)
+        page_break.setPageBreakPolicy(QTextFormat.PageBreakFlag.PageBreak_AlwaysBefore)
+        page_break.setProperty(int(QTextFormat.Property.UserProperty) + 104, True)
+        cursor.setBlockFormat(page_break)
+        cursor.insertBlock(following)
+        cursor.endEditBlock()
         self.setTextCursor(cursor)
 
     def insert_image(
@@ -640,27 +740,42 @@ class PaginatedTextEdit(QTextEdit):
         return None
 
     def _schedule_layout_update(self) -> None:
+        if not self._document_active:
+            return
         self.model_changed.emit()
         self._pagination_timer.start()
         self.viewport().update()
 
     def _cursor_position_changed(self) -> None:
+        if self._document_active:
+            self.set_active_page(self.current_page)
         rect = self.visual_cursor_rect()
         self.cursor_visibility_requested.emit(rect)
         self.viewport().update()
 
     def _emit_pagination(self) -> None:
-        count = self.page_count
+        if not self._document_active:
+            return
+        count = self.pagination_snapshot().page_count
+        changed = count != self._page_count
+        self._page_count = count
         self._refresh_presentation(count)
-        if count != self._page_count:
-            self._page_count = count
+        if changed:
             self.pagination_changed.emit(count)
+
+    def refresh_pagination(self) -> int:
+        """Synchronously refresh cached pagination for explicit save/export actions."""
+
+        self._pagination_timer.stop()
+        self._emit_pagination()
+        return self._page_count
 
     def _refresh_presentation(self, page_count: int) -> None:
         selected = PagePresentation(self._geometry, max(1, page_count))
         if selected == self._presentation:
             return
         self._presentation = selected
+        self._active_page = min(self._active_page, selected.page_count - 1)
         self.presentation_changed.emit()
         self.viewport().update()
 

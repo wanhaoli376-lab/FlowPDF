@@ -298,9 +298,10 @@ class DocumentModeController(QObject):
         if self.document is None or self.tasks.active_count:
             return
         target = Path(path)
-        document = self.window.document_editor_view.editor.flow_document()
+        editor = self.window.document_editor_view.editor
+        expected_pages = editor.refresh_pagination()
+        document = editor.flow_document()
         exported_revision = self._edit_revision
-        expected_pages = self.window.document_editor_view.editor.page_count
 
         def perform(context: TaskContext) -> PdfExportResult:
             return self._exporter.export(
@@ -414,7 +415,7 @@ class DocumentModeController(QObject):
         document = editor.flow_document()
         cursor = editor.textCursor()
         position, anchor = cursor.position(), cursor.anchor()
-        scroll = editor.verticalScrollBar().value()
+        scroll = self.window.document_editor_view.scroll_y
         zoom = editor.zoom_factor
         document.page_setup = setup
         self._applying = True

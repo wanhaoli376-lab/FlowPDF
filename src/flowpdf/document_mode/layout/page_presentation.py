@@ -93,6 +93,21 @@ class PagePresentation:
         )
         return max(0, min(self.page_count - 1, selected))
 
+    def page_for_visual_y(self, value: float) -> int:
+        """Return the nearest physical page for a workspace y coordinate."""
+
+        relative_y = value - self.workspace_padding_px
+        if relative_y <= 0:
+            return 0
+        stride = self.geometry.page_height_px + self.page_gap_px
+        page = math.floor(relative_y / stride)
+        if page >= self.page_count:
+            return self.page_count - 1
+        within_stride = relative_y - page * stride
+        if within_stride > self.geometry.page_height_px + self.page_gap_px / 2:
+            page += 1
+        return max(0, min(self.page_count - 1, page))
+
     def visual_to_document(self, point: QPointF) -> QPointF | None:
         relative_y = point.y() - self.workspace_padding_px
         if relative_y < 0:
@@ -107,6 +122,18 @@ class PagePresentation:
         return QPointF(
             point.x() - content.left(),
             page * self.geometry.content_height_px + point.y() - content.top(),
+        )
+
+    def visual_to_document_clamped(self, point: QPointF) -> QPointF:
+        """Map margins or page gaps to the nearest editable content edge."""
+
+        page = self.page_for_visual_y(point.y())
+        content = self.content_rect(page)
+        x = min(max(point.x(), content.left()), content.right())
+        y = min(max(point.y(), content.top()), content.bottom() - 0.01)
+        return QPointF(
+            x - content.left(),
+            page * self.geometry.content_height_px + y - content.top(),
         )
 
     def page_indices_intersecting(self, rect: QRectF) -> tuple[int, ...]:
