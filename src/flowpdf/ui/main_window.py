@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 from flowpdf.backends.base import AnnotationInfo, PageInfo
 from flowpdf.document_mode.importing import ImportReport
 from flowpdf.document_mode.models import FlowDocument
-from flowpdf.document_mode.ui import DocumentEditorView, DocumentToolbar
+from flowpdf.document_mode.ui import DocumentEditorView, DocumentPageList, DocumentToolbar
 from flowpdf.editing.tools import ToolMode
 from flowpdf.i18n import tr
 from flowpdf.rendering.render_scheduler import RenderScheduler, RenderSource
@@ -164,6 +164,7 @@ class MainWindow(QMainWindow):
 
     def clear_document_editor(self) -> None:
         self.document_editor_view.clear_document()
+        self.document_page_list.clear_document()
         if self.active_mode == "document":
             self.active_mode = "welcome"
             self._workspace.setCurrentWidget(self._welcome)
@@ -181,9 +182,8 @@ class MainWindow(QMainWindow):
         self.page_status.setText(f"第 {page + 1} 页，共 {count} 页")
         self.total_pages_label.setText(f"/ {count}")
         if self.document_page_list.count() != count:
-            self.document_page_list.clear()
-            self.document_page_list.addItems([f"第 {index + 1} 页" for index in range(count)])
-        self.document_page_list.setCurrentRow(page)
+            self.document_page_list.set_page_count(count)
+        self.document_page_list.select_page(page)
 
     def update_document_word_count(self, count: int) -> None:
         self.word_status.setText(f"字符 {max(0, count)}")
@@ -229,6 +229,8 @@ class MainWindow(QMainWindow):
             self.zoom_in_action,
             self.zoom_out_action,
             self.actual_size_action,
+            self.fit_page_action,
+            self.fit_width_action,
         ):
             action.setEnabled(enabled)
         self.document_toolbar.setEnabled(enabled)
@@ -561,7 +563,10 @@ class MainWindow(QMainWindow):
         self.annotations_tab = self.navigation_tabs.addTab(
             self.annotation_panel, tr("MainWindow", "批注")
         )
-        self.document_page_list = QListWidget(self.navigation_tabs)
+        self.document_page_list = DocumentPageList(
+            self.document_editor_view.editor,
+            self.navigation_tabs,
+        )
         self.document_pages_tab = self.navigation_tabs.addTab(self.document_page_list, "文档页")
         self.document_outline_list = QListWidget(self.navigation_tabs)
         self.document_outline_tab = self.navigation_tabs.addTab(
@@ -621,8 +626,8 @@ class MainWindow(QMainWindow):
         self.zoom_in_action.triggered.connect(self._zoom_in)
         self.zoom_out_action.triggered.connect(self._zoom_out)
         self.actual_size_action.triggered.connect(self._actual_size)
-        self.fit_page_action.triggered.connect(self.document_view.fit_page)
-        self.fit_width_action.triggered.connect(self.document_view.fit_width)
+        self.fit_page_action.triggered.connect(self._fit_page)
+        self.fit_width_action.triggered.connect(self._fit_width)
         self.continuous_action.toggled.connect(self.document_view.set_continuous_mode)
         self.document_view.zoom_changed.connect(
             lambda zoom: self.zoom_status.setText(f"{round(zoom * 100)}%")
@@ -676,6 +681,18 @@ class MainWindow(QMainWindow):
             self.document_editor_view.editor.actual_size()
         else:
             self.document_view.actual_size()
+
+    def _fit_page(self) -> None:
+        if self.active_mode == "document":
+            self.document_editor_view.fit_page()
+        else:
+            self.document_view.fit_page()
+
+    def _fit_width(self) -> None:
+        if self.active_mode == "document":
+            self.document_editor_view.fit_width()
+        else:
+            self.document_view.fit_width()
 
     def _apply_mode_ui(self) -> None:
         is_document = self.active_mode == "document"

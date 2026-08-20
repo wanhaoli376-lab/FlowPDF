@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QPointF, QSizeF, Qt, Signal
 from PySide6.QtGui import QResizeEvent, QTextCursor
 from PySide6.QtWidgets import (
     QFrame,
@@ -27,10 +27,16 @@ class _ZoomableEditorCanvas(QGraphicsView):
         self._proxy = scene.addWidget(editor)
         self.setScene(scene)
         self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         editor.zoom_changed.connect(self.set_zoom_factor)
+        editor.presentation_changed.connect(self._resize_proxy)
+        editor.cursor_visibility_requested.connect(self._ensure_cursor_visible)
+        editor.wheel_scroll_requested.connect(self._scroll_from_wheel)
+        self._resize_proxy()
 
     def set_zoom_factor(self, factor: float) -> None:
         self._zoom_factor = factor
@@ -38,16 +44,34 @@ class _ZoomableEditorCanvas(QGraphicsView):
         self.scale(factor, factor)
         self._resize_proxy()
 
+    def fit_width(self) -> None:
+        factor = self.editor.page_presentation.fit_width_factor(QSizeF(self.viewport().size()))
+        self.editor.set_zoom_factor(factor)
+
+    def fit_page(self) -> None:
+        factor = self.editor.page_presentation.fit_page_factor(QSizeF(self.viewport().size()))
+        self.editor.set_zoom_factor(factor)
+
     def resizeEvent(self, event: QResizeEvent) -> None:
         super().resizeEvent(event)
         self._resize_proxy()
 
     def _resize_proxy(self) -> None:
-        viewport = self.viewport().size()
-        width = max(1.0, viewport.width() / self._zoom_factor)
-        height = max(1.0, viewport.height() / self._zoom_factor)
-        self._proxy.resize(width, height)
+        size = self.editor.page_presentation.visual_size
+        self.editor.setFixedSize(size.toSize())
+        self._proxy.resize(size)
         self.scene().setSceneRect(self._proxy.boundingRect())
+
+    def _ensure_cursor_visible(self, rect) -> None:
+        self.ensureVisible(rect, 36, 36)
+
+    def _scroll_from_wheel(self, delta_x: int, delta_y: int) -> None:
+        if delta_y:
+            bar = self.verticalScrollBar()
+            bar.setValue(bar.value() - delta_y)
+        if delta_x:
+            bar = self.horizontalScrollBar()
+            bar.setValue(bar.value() - delta_x)
 
 
 class DocumentEditorView(QWidget):
@@ -61,8 +85,8 @@ class DocumentEditorView(QWidget):
         self.editor.setObjectName("documentModeTextEdit")
         self.editor.setStyleSheet(
             "QTextEdit#documentModeTextEdit {"
-            "background: white; color: #111827; border: 1px solid #cbd5e1;"
-            "padding: 28px; selection-background-color: #bfdbfe;"
+            "background: #e5e7eb; color: #111827; border: 0;"
+            "selection-background-color: #bfdbfe;"
             "}"
         )
         self.import_notice = QLabel(self)
@@ -84,12 +108,11 @@ class DocumentEditorView(QWidget):
 
     @property
     def current_page(self) -> int:
-        snapshot = self.editor.pagination_snapshot()
-        block_number = self.editor.textCursor().blockNumber()
-        if not snapshot.block_pages:
-            return 0
-        block_number = min(max(0, block_number), len(snapshot.block_pages) - 1)
-        return snapshot.block_pages[block_number]
+        return self.editor.current_page
+
+    @property
+    def scroll_y(self) -> int:
+        return self.editor_canvas.verticalScrollBar().value()
 
     def set_document(self, document: FlowDocument, report: ImportReport | None = None) -> None:
         self.editor.set_flow_document(document)
@@ -110,6 +133,12 @@ class DocumentEditorView(QWidget):
         self.editor.clear()
         self.import_notice.hide()
 
+    def fit_width(self) -> None:
+        self.editor_canvas.fit_width()
+
+    def fit_page(self) -> None:
+        self.editor_canvas.fit_page()
+
     def restore_cursor(
         self,
         position: int,
@@ -126,17 +155,23 @@ class DocumentEditorView(QWidget):
             QTextCursor.MoveMode.KeepAnchor,
         )
         self.editor.setTextCursor(cursor)
-        self.editor.verticalScrollBar().setValue(max(0, scroll_y))
+        self.editor_canvas.verticalScrollBar().setValue(max(0, scroll_y))
 
     def jump_to_page(self, page_index: int) -> None:
         snapshot = self.editor.pagination_snapshot()
         target = max(0, min(page_index, snapshot.page_count - 1))
-        try:
-            block_number = snapshot.block_pages.index(target)
-        except ValueError:
-            block_number = max(0, len(snapshot.block_pages) - 1)
-        block = self.editor.document().findBlockByNumber(block_number)
-        cursor = QTextCursor(block)
+        logical_y = target * self.editor.page_geometry.content_height_px + 1.0
+        position = (
+            self.editor.document()
+            .documentLayout()
+            .hitTest(
+                QPointF(self.editor.page_geometry.content_width_px / 2, logical_y),
+                Qt.HitTestAccuracy.FuzzyHit,
+            )
+        )
+        cursor = QTextCursor(self.editor.document())
+        end = max(0, self.editor.document().characterCount() - 1)
+        cursor.setPosition(min(max(0, position), end))
         self.editor.setTextCursor(cursor)
         self.editor.ensureCursorVisible()
         self.editor.setFocus()

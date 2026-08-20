@@ -8,10 +8,17 @@ from html.parser import HTMLParser
 from typing import ClassVar
 
 from PIL import Image, UnidentifiedImageError
-from PySide6.QtCore import QMimeData, QSizeF, Qt, QTimer, Signal
+from PySide6.QtCore import QMimeData, QRectF, QSize, QSizeF, Qt, QTimer, Signal
 from PySide6.QtGui import (
+    QAbstractTextDocumentLayout,
     QColor,
     QFont,
+    QImage,
+    QMouseEvent,
+    QPainter,
+    QPaintEvent,
+    QPalette,
+    QPen,
     QTextBlockFormat,
     QTextCharFormat,
     QTextCursor,
@@ -20,11 +27,17 @@ from PySide6.QtGui import (
     QTextFormat,
     QTextImageFormat,
     QTextListFormat,
+    QWheelEvent,
 )
-from PySide6.QtWidgets import QTextEdit
+from PySide6.QtWidgets import QFrame, QTextEdit
 
 from flowpdf.document_mode.editing.document_mapper import BASE_FONT_SIZE_PT, DocumentMapper
-from flowpdf.document_mode.layout import PageGeometry, PaginationSnapshot, Paginator
+from flowpdf.document_mode.layout import (
+    PageGeometry,
+    PagePresentation,
+    PaginationSnapshot,
+    Paginator,
+)
 from flowpdf.document_mode.models import FlowDocument, ImageAsset
 
 
@@ -32,6 +45,9 @@ class PaginatedTextEdit(QTextEdit):
     """One continuous rich text editor whose QTextDocument paginates automatically."""
 
     pagination_changed = Signal(int)
+    presentation_changed = Signal()
+    cursor_visibility_requested = Signal(QRectF)
+    wheel_scroll_requested = Signal(int, int)
     model_changed = Signal()
     zoom_changed = Signal(float)
 
@@ -40,6 +56,7 @@ class PaginatedTextEdit(QTextEdit):
         self._mapper = DocumentMapper()
         self._geometry = PageGeometry.from_setup(FlowDocument.new().page_setup)
         self._page_count = 1
+        self._presentation = PagePresentation(self._geometry, 1)
         self._zoom_factor = 1.0
         self._pagination_timer = QTimer(self)
         self._pagination_timer.setSingleShot(True)
@@ -47,15 +64,17 @@ class PaginatedTextEdit(QTextEdit):
         self._pagination_timer.timeout.connect(self._emit_pagination)
         self.setAcceptRichText(True)
         self.setUndoRedoEnabled(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         default_font = self.document().defaultFont()
         default_font.setPointSizeF(BASE_FONT_SIZE_PT)
         self.document().setDefaultFont(default_font)
         self.setFont(default_font)
         self.setLineWrapMode(QTextEdit.LineWrapMode.FixedPixelWidth)
         self.document().contentsChanged.connect(self._schedule_layout_update)
-        self.setStyleSheet(
-            "QTextEdit { background: #e5e7eb; color: #111827; border: 0; padding: 24px; }"
-        )
+        self.cursorPositionChanged.connect(self._cursor_position_changed)
+        self.setStyleSheet("QTextEdit { background: #e5e7eb; color: #111827; border: 0; }")
 
     @property
     def page_geometry(self) -> PageGeometry:
@@ -64,6 +83,10 @@ class PaginatedTextEdit(QTextEdit):
     @property
     def page_count(self) -> int:
         return self.pagination_snapshot().page_count
+
+    @property
+    def page_presentation(self) -> PagePresentation:
+        return self._presentation
 
     @property
     def zoom_factor(self) -> float:
@@ -75,6 +98,7 @@ class PaginatedTextEdit(QTextEdit):
         self._geometry = self._mapper.populate(self.document(), document)
         self._apply_zoom_geometry()
         self._page_count = self.page_count
+        self._refresh_presentation(self._page_count)
         self.moveCursor(QTextCursor.MoveOperation.Start)
 
     def zoom_in(self) -> None:
@@ -87,7 +111,7 @@ class PaginatedTextEdit(QTextEdit):
         self.set_zoom_factor(1.0)
 
     def set_zoom_factor(self, factor: float) -> None:
-        selected = round(min(3.0, max(0.5, factor)), 1)
+        selected = round(min(3.0, max(0.2, factor)), 2)
         if selected == self._zoom_factor:
             return
         self._zoom_factor = selected
@@ -99,6 +123,183 @@ class PaginatedTextEdit(QTextEdit):
         self.setLineWrapColumnOrWidth(round(width))
         self.document().setPageSize(QSizeF(width, height))
         self.setMinimumWidth(0)
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        painter.fillRect(event.rect(), QColor("#e5e7eb"))
+        context = self._paint_context()
+        active_page = self._cursor_page()
+        layout = self.document().documentLayout()
+        repaint_rect = QRectF(event.rect())
+        for page_index in self._presentation.page_indices_intersecting(repaint_rect):
+            paper = self._presentation.paper_rect(page_index)
+            painter.fillRect(paper.translated(3, 4), QColor("#c4c9d0"))
+            painter.fillRect(paper, QColor("#ffffff"))
+            border = QColor("#3b82f6") if page_index == active_page else QColor("#cbd5e1")
+            painter.setPen(QPen(border, 1.5 if page_index == active_page else 1.0))
+            painter.drawRect(paper)
+
+            content = self._presentation.content_rect(page_index)
+            painter.save()
+            painter.setClipRect(content)
+            logical_top = page_index * self._geometry.content_height_px
+            painter.translate(content.left(), content.top() - logical_top)
+            context.clip = QRectF(
+                0,
+                logical_top,
+                self._geometry.content_width_px,
+                self._geometry.content_height_px,
+            )
+            layout.draw(painter, context)
+            painter.restore()
+        painter.end()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        mapped = self._mapped_mouse_event(event)
+        if mapped is None:
+            event.ignore()
+            return
+        super().mousePressEvent(mapped)
+        self.viewport().update()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        mapped = self._mapped_mouse_event(event)
+        if mapped is None:
+            event.ignore()
+            return
+        super().mouseMoveEvent(mapped)
+        self.viewport().update()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        mapped = self._mapped_mouse_event(event)
+        if mapped is None:
+            event.ignore()
+            return
+        super().mouseReleaseEvent(mapped)
+        self.viewport().update()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        mapped = self._mapped_mouse_event(event)
+        if mapped is None:
+            event.ignore()
+            return
+        super().mouseDoubleClickEvent(mapped)
+        self.viewport().update()
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        delta = event.pixelDelta() if not event.pixelDelta().isNull() else event.angleDelta()
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if delta.y() > 0:
+                self.zoom_in()
+            elif delta.y() < 0:
+                self.zoom_out()
+            event.accept()
+            return
+        self.wheel_scroll_requested.emit(delta.x(), delta.y())
+        event.accept()
+
+    def visual_cursor_rect(self, cursor: QTextCursor | None = None) -> QRectF:
+        logical = self.document_cursor_rect(cursor)
+        return self._presentation.document_to_visual_rect(logical)
+
+    def document_cursor_rect(self, cursor: QTextCursor | None = None) -> QRectF:
+        return QRectF(super().cursorRect(cursor or self.textCursor()))
+
+    @property
+    def current_page(self) -> int:
+        return self._presentation.page_for_document_y(self.document_cursor_rect().center().y())
+
+    def render_page_thumbnail(self, page_index: int, size: QSize) -> QImage:
+        if not 0 <= page_index < self._presentation.page_count:
+            raise IndexError("页面索引超出范围")
+        if size.width() <= 0 or size.height() <= 0:
+            raise ValueError("缩略图尺寸必须大于零")
+        image = QImage(size, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(QColor("#e5e7eb"))
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        available_width = max(1.0, size.width() - 6.0)
+        available_height = max(1.0, size.height() - 6.0)
+        scale = min(
+            available_width / self._geometry.page_width_px,
+            available_height / self._geometry.page_height_px,
+        )
+        shown_width = self._geometry.page_width_px * scale
+        shown_height = self._geometry.page_height_px * scale
+        origin_x = (size.width() - shown_width) / 2
+        origin_y = (size.height() - shown_height) / 2
+        painter.translate(origin_x, origin_y)
+        painter.scale(scale, scale)
+        paper = QRectF(0, 0, self._geometry.page_width_px, self._geometry.page_height_px)
+        painter.fillRect(paper, QColor("#ffffff"))
+        painter.setPen(QPen(QColor("#cbd5e1"), 1.0 / scale))
+        painter.drawRect(paper)
+
+        left = self._geometry.points_to_pixels(self._geometry.margin_left_pt)
+        top = self._geometry.points_to_pixels(self._geometry.margin_top_pt)
+        content = QRectF(
+            left,
+            top,
+            self._geometry.content_width_px,
+            self._geometry.content_height_px,
+        )
+        painter.setClipRect(content)
+        logical_top = page_index * self._geometry.content_height_px
+        painter.translate(content.left(), content.top() - logical_top)
+        context = QAbstractTextDocumentLayout.PaintContext()
+        context.palette = self.palette()
+        context.cursorPosition = -1
+        context.clip = QRectF(
+            0,
+            logical_top,
+            self._geometry.content_width_px,
+            self._geometry.content_height_px,
+        )
+        self.document().documentLayout().draw(painter, context)
+        painter.end()
+        return image
+
+    def inputMethodQuery(self, query: Qt.InputMethodQuery):
+        if query == Qt.InputMethodQuery.ImCursorRectangle:
+            return self.visual_cursor_rect()
+        return super().inputMethodQuery(query)
+
+    def _mapped_mouse_event(self, event: QMouseEvent) -> QMouseEvent | None:
+        position = self._presentation.visual_to_document(event.position())
+        if position is None:
+            return None
+        return QMouseEvent(
+            event.type(),
+            position,
+            event.globalPosition(),
+            event.button(),
+            event.buttons(),
+            event.modifiers(),
+            event.pointingDevice(),
+        )
+
+    def _paint_context(self) -> QAbstractTextDocumentLayout.PaintContext:
+        context = QAbstractTextDocumentLayout.PaintContext()
+        context.palette = self.palette()
+        cursor = self.textCursor()
+        selections = list(self.extraSelections())
+        if cursor.hasSelection():
+            selected = QTextEdit.ExtraSelection()
+            selected.cursor = cursor
+            selected.format.setBackground(self.palette().brush(QPalette.ColorRole.Highlight))
+            selected.format.setForeground(self.palette().brush(QPalette.ColorRole.HighlightedText))
+            selections.append(selected)
+        for value in selections:
+            selection = QAbstractTextDocumentLayout.Selection()
+            selection.cursor = value.cursor
+            selection.format = value.format
+            context.selections.append(selection)
+        context.cursorPosition = cursor.position() if self.hasFocus() else -1
+        return context
+
+    def _cursor_page(self) -> int:
+        return self.current_page
 
     def flow_document(self) -> FlowDocument:
         return self._mapper.to_model(self.document())
@@ -441,12 +642,27 @@ class PaginatedTextEdit(QTextEdit):
     def _schedule_layout_update(self) -> None:
         self.model_changed.emit()
         self._pagination_timer.start()
+        self.viewport().update()
+
+    def _cursor_position_changed(self) -> None:
+        rect = self.visual_cursor_rect()
+        self.cursor_visibility_requested.emit(rect)
+        self.viewport().update()
 
     def _emit_pagination(self) -> None:
         count = self.page_count
+        self._refresh_presentation(count)
         if count != self._page_count:
             self._page_count = count
             self.pagination_changed.emit(count)
+
+    def _refresh_presentation(self, page_count: int) -> None:
+        selected = PagePresentation(self._geometry, max(1, page_count))
+        if selected == self._presentation:
+            return
+        self._presentation = selected
+        self.presentation_changed.emit()
+        self.viewport().update()
 
 
 def _sanitize_html(value: str) -> str:

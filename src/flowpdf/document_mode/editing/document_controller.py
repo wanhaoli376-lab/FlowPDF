@@ -589,7 +589,7 @@ class DocumentModeController(QObject):
         return ProjectState(
             cursor_position=cursor.position(),
             selection_anchor=cursor.anchor(),
-            scroll_y=editor.verticalScrollBar().value(),
+            scroll_y=self.window.document_editor_view.scroll_y,
             current_page=self.window.document_editor_view.current_page,
             zoom_factor=editor.zoom_factor,
         )

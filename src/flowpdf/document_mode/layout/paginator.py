@@ -45,8 +45,13 @@ class Paginator:
                 top = rect.top() + page_offset
             top = round(top, 4)
             block_tops.append(top)
-            block_pages.append(max(0, int(top // page_height)))
-            line_counts.append(block.layout().lineCount())
+            line_count = block.layout().lineCount()
+            first_line_center = 0.5
+            if line_count:
+                first_line = block.layout().lineAt(0)
+                first_line_center = first_line.y() + first_line.height() / 2
+            block_pages.append(max(0, int((top + first_line_center) // page_height)))
+            line_counts.append(line_count)
             maximum_bottom = max(maximum_bottom, top + rect.height())
             block = block.next()
         return PaginationSnapshot(

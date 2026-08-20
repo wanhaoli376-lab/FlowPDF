@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QMessageBox
 
 from flowpdf.application import create_application
 from flowpdf.document_mode.export import ProjectReader
+from flowpdf.document_mode.models import FlowDocument, Paragraph, TextRun
 
 
 def _wait_until(qapp, predicate, timeout: float = 8.0) -> bool:
@@ -68,6 +69,10 @@ def test_application_document_mode_closed_edit_project_export_loop(qapp, tmp_pat
     editor.set_zoom_factor(1.3)
     assert controller.is_dirty
     assert editor.page_count >= 2
+    canvas_scroll = window.document_editor_view.editor_canvas.verticalScrollBar()
+    canvas_scroll.setValue(min(180, canvas_scroll.maximum()))
+    saved_scroll_y = canvas_scroll.value()
+    assert saved_scroll_y > 0
 
     controller.save_project_to(project)
     assert _wait_until(qapp, lambda: project.exists() and controller.tasks.active_count == 0)
@@ -78,6 +83,7 @@ def test_application_document_mode_closed_edit_project_export_loop(qapp, tmp_pat
     assert _wait_until(qapp, lambda: controller.document is not None)
     assert inserted in editor.toPlainText()
     assert editor.zoom_factor == 1.3
+    assert window.document_editor_view.editor_canvas.verticalScrollBar().value() == saved_scroll_y
 
     controller.export_pdf_to(output)
     assert _wait_until(qapp, lambda: output.exists() and controller.tasks.active_count == 0)
@@ -346,4 +352,63 @@ def test_reimport_after_discard_removes_previous_document_recovery(
 
     assert controller.recovery_service.list_sessions() == []
     controller.close_document(discard=True)
+    window.close()
+
+
+def test_main_window_routes_fit_actions_to_the_active_document_editor(qapp, tmp_path) -> None:
+    _app, window = create_application(["flowpdf-test"], data_root=tmp_path / "app-data")
+    document = FlowDocument.new()
+    document.append_block(Paragraph(runs=[TextRun("适应页面与适应宽度")]))
+    window.resize(1600, 720)
+    window.show_document_editor(document)
+    window.show()
+    qapp.processEvents()
+
+    assert window.fit_width_action.isEnabled()
+    assert window.fit_page_action.isEnabled()
+    window.fit_width_action.trigger()
+    width_factor = window.document_editor_view.editor.zoom_factor
+    assert width_factor == window.document_editor_view.editor_canvas.transform().m11()
+
+    window.fit_page_action.trigger()
+    page_factor = window.document_editor_view.editor.zoom_factor
+    assert page_factor == window.document_editor_view.editor_canvas.transform().m11()
+    assert page_factor < width_factor
+    window.document_mode_controller.close_document(discard=True)
+    window.close()
+
+
+def test_document_page_navigation_debounces_live_thumbnails(qapp, tmp_path) -> None:
+    _app, window = create_application(["flowpdf-test"], data_root=tmp_path / "app-data")
+    document = FlowDocument.new()
+    for index in range(24):
+        document.append_block(Paragraph(runs=[TextRun(f"第 {index + 1} 段缩略图内容。" * 8)]))
+    window.show_document_editor(document)
+    window.show()
+
+    page_list = window.document_page_list
+    assert _wait_until(
+        qapp,
+        lambda: (
+            page_list.count() == window.document_editor_view.editor.page_count
+            and page_list.count() > 1
+            and not page_list.item(0).icon().isNull()
+        ),
+    )
+    previous_key = page_list.item(0).icon().cacheKey()
+    editor = window.document_editor_view.editor
+    editor.moveCursor(QTextCursor.MoveOperation.Start)
+    editor.insertPlainText("缩略图应该在防抖后更新。" * 20)
+
+    assert _wait_until(
+        qapp,
+        lambda: (
+            page_list.count() == editor.page_count
+            and not page_list.item(0).icon().isNull()
+            and page_list.item(0).icon().cacheKey() != previous_key
+        ),
+    )
+    page_list.setCurrentRow(1)
+    assert _wait_until(qapp, lambda: window.document_editor_view.current_page == 1)
+    window.document_mode_controller.close_document(discard=True)
     window.close()

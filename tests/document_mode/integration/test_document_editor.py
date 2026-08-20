@@ -3,8 +3,9 @@ from __future__ import annotations
 import io
 
 from PIL import Image
-from PySide6.QtCore import QMimeData, QRect, QRectF, Qt
-from PySide6.QtGui import QInputMethodEvent, QTextCursor
+from PySide6.QtCore import QMimeData, QPoint, QPointF, QRect, QRectF, QSize, QSizeF, Qt
+from PySide6.QtGui import QInputMethodEvent, QTextCursor, QWheelEvent
+from PySide6.QtTest import QTest
 
 from flowpdf.document_mode.editing import PaginatedTextEdit
 from flowpdf.document_mode.models import (
@@ -303,4 +304,276 @@ def test_editor_preserves_run_sources_sections_and_visual_zoom(qapp) -> None:
     editor.actual_size()
     assert editor.zoom_factor == 1.0
     assert view.editor_canvas.transform().m11() == 1.0
+    view.close()
+
+
+def test_document_editor_view_displays_separated_physical_paper(qapp) -> None:
+    document = _reflow_document()
+    document.sections[0].blocks[0].runs[0].text += "分页纸张内容。" * 80
+    view = DocumentEditorView()
+    view.resize(720, 520)
+    view.set_document(document)
+    view.show()
+    qapp.processEvents()
+
+    presentation = view.editor.page_presentation
+    assert presentation.page_count >= 2
+    first = presentation.paper_rect(0)
+    second = presentation.paper_rect(1)
+    assert second.top() > first.bottom()
+    assert view.editor.height() >= round(presentation.visual_size.height())
+
+    rendered = view.editor.grab().toImage()
+    paper_color = rendered.pixelColor(round(first.left() + 5), round(first.top() + 5))
+    gap_color = rendered.pixelColor(
+        round(first.center().x()),
+        round((first.bottom() + second.top()) / 2),
+    )
+    assert paper_color.lightness() > gap_color.lightness() + 20
+    content = presentation.content_rect(0).toAlignedRect()
+    dark_content_pixels = sum(
+        rendered.pixelColor(x, y).lightness() < 160
+        for x in range(content.left(), min(content.right(), rendered.width() - 1), 2)
+        for y in range(content.top(), min(content.bottom(), rendered.height() - 1), 2)
+    )
+    assert dark_content_pixels > 40
+    view.close()
+
+
+def test_clicking_text_on_a_later_visual_page_places_the_document_cursor(qapp) -> None:
+    document = _reflow_document()
+    document.sections[0].blocks[0].runs[0].text += "跨页点击命中。" * 80
+    view = DocumentEditorView()
+    view.resize(720, 520)
+    view.set_document(document)
+    view.show()
+    qapp.processEvents()
+
+    editor = view.editor
+    snapshot = editor.pagination_snapshot()
+    target_block_number = next(
+        index for index, page_index in enumerate(snapshot.block_pages) if page_index > 0
+    )
+    block = editor.document().findBlockByNumber(target_block_number)
+    block_rect = editor.document().documentLayout().blockBoundingRect(block)
+    logical_point = QPointF(block_rect.left() + 8, block_rect.top() + 8)
+    visual_point = editor.page_presentation.document_to_visual(logical_point)
+
+    QTest.mouseClick(
+        editor.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=visual_point.toPoint(),
+    )
+
+    assert editor.textCursor().blockNumber() == target_block_number
+    view.close()
+
+
+def test_mouse_drag_selects_text_across_physical_page_gap(qapp) -> None:
+    document = _reflow_document()
+    document.sections[0].blocks[0].runs[0].text += "跨页拖动选择。" * 80
+    view = DocumentEditorView()
+    view.resize(720, 520)
+    view.set_document(document)
+    view.show()
+    qapp.processEvents()
+
+    editor = view.editor
+    snapshot = editor.pagination_snapshot()
+    target_block_number = next(
+        index for index, page_index in enumerate(snapshot.block_pages) if page_index > 0
+    )
+    first_block = editor.document().begin()
+    target_block = editor.document().findBlockByNumber(target_block_number)
+    first_rect = editor.document().documentLayout().blockBoundingRect(first_block)
+    target_rect = editor.document().documentLayout().blockBoundingRect(target_block)
+    start = editor.page_presentation.document_to_visual(
+        QPointF(first_rect.left() + 4, first_rect.top() + 4)
+    )
+    end = editor.page_presentation.document_to_visual(
+        QPointF(target_rect.right() - 4, target_rect.top() + 8)
+    )
+
+    QTest.mousePress(editor.viewport(), Qt.MouseButton.LeftButton, pos=start.toPoint())
+    QTest.mouseMove(editor.viewport(), end.toPoint())
+    QTest.mouseRelease(editor.viewport(), Qt.MouseButton.LeftButton, pos=end.toPoint())
+
+    cursor = editor.textCursor()
+    assert cursor.hasSelection()
+    assert cursor.selectionStart() < target_block.position()
+    assert cursor.selectionEnd() >= target_block.position()
+    assert cursor.selectionEnd() <= target_block.position() + target_block.length()
+    view.close()
+
+
+def test_double_click_selects_a_word_on_a_later_physical_page(qapp) -> None:
+    document = FlowDocument.new()
+    document.page_setup = PageSetup(
+        width_pt=260,
+        height_pt=220,
+        margin_top_pt=30,
+        margin_bottom_pt=30,
+        margin_left_pt=30,
+        margin_right_pt=30,
+    )
+    document.append_block(Paragraph(runs=[TextRun("filler " * 180)]))
+    document.append_block(Paragraph(runs=[TextRun("TargetWord trailing")]))
+    view = DocumentEditorView()
+    view.resize(720, 520)
+    view.set_document(document)
+    view.show()
+    qapp.processEvents()
+
+    editor = view.editor
+    target = editor.document().findBlockByNumber(1)
+    target_rect = editor.document().documentLayout().blockBoundingRect(target)
+    visual = editor.page_presentation.document_to_visual(
+        QPointF(target_rect.left() + 8, target_rect.top() + 8)
+    )
+    QTest.mouseDClick(
+        editor.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=visual.toPoint(),
+    )
+
+    assert editor.textCursor().selectedText() == "TargetWord"
+    view.close()
+
+
+def test_later_page_cursor_scrolls_into_view_and_reports_visual_ime_rectangle(qapp) -> None:
+    document = FlowDocument.new()
+    document.page_setup = PageSetup(
+        width_pt=260,
+        height_pt=220,
+        margin_top_pt=30,
+        margin_bottom_pt=30,
+        margin_left_pt=30,
+        margin_right_pt=30,
+    )
+    for index in range(18):
+        document.append_block(Paragraph(runs=[TextRun(f"第 {index + 1} 段候选框测试。" * 4)]))
+    view = DocumentEditorView()
+    view.resize(520, 360)
+    view.set_document(document)
+    view.show()
+    qapp.processEvents()
+
+    editor = view.editor
+    target = editor.document().findBlockByNumber(15)
+    cursor = QTextCursor(target)
+    editor.setTextCursor(cursor)
+    qapp.processEvents()
+    snapshot = editor.pagination_snapshot()
+    target_page = snapshot.block_pages[target.blockNumber()]
+    candidate = editor.inputMethodQuery(Qt.InputMethodQuery.ImCursorRectangle)
+
+    assert isinstance(candidate, (QRect, QRectF))
+    assert editor.page_presentation.content_rect(target_page).contains(candidate.center())
+    assert view.editor_canvas.verticalScrollBar().value() > 0
+    view.close()
+
+
+def test_document_editor_view_fits_physical_page_and_width(qapp) -> None:
+    document = _reflow_document()
+    view = DocumentEditorView()
+    view.resize(760, 520)
+    view.set_document(document)
+    view.show()
+    qapp.processEvents()
+    viewport = QSizeF(view.editor_canvas.viewport().size())
+    presentation = view.editor.page_presentation
+
+    view.fit_width()
+    expected_width = round(presentation.fit_width_factor(viewport), 2)
+    assert view.editor.zoom_factor == expected_width
+    assert abs(view.editor_canvas.transform().m11() - expected_width) < 0.001
+
+    view.fit_page()
+    expected_page = round(presentation.fit_page_factor(viewport), 2)
+    assert view.editor.zoom_factor == expected_page
+    assert abs(view.editor_canvas.transform().m11() - expected_page) < 0.001
+    view.close()
+
+
+def test_document_editor_renders_a_low_resolution_page_thumbnail(qapp) -> None:
+    document = _reflow_document()
+    editor = PaginatedTextEdit()
+    editor.set_flow_document(document)
+
+    thumbnail = editor.render_page_thumbnail(0, QSize(140, 180))
+
+    assert not thumbnail.isNull()
+    assert thumbnail.size() == QSize(140, 180)
+    colors = {
+        thumbnail.pixelColor(x, y).name()
+        for x in range(0, thumbnail.width(), 10)
+        for y in range(0, thumbnail.height(), 10)
+    }
+    assert "#ffffff" in colors
+    assert len(colors) >= 3
+    dark_content_pixels = sum(
+        thumbnail.pixelColor(x, y).lightness() < 160
+        for x in range(16, thumbnail.width() - 16)
+        for y in range(16, thumbnail.height() - 16)
+    )
+    assert dark_content_pixels > 40
+    editor.close()
+
+
+def test_page_navigation_can_jump_into_a_page_inside_one_long_paragraph(qapp) -> None:
+    document = _reflow_document()
+    document.sections[0].blocks = [Paragraph(runs=[TextRun("连续长段落。" * 500)])]
+    view = DocumentEditorView()
+    view.resize(520, 360)
+    view.set_document(document)
+    view.show()
+    qapp.processEvents()
+    assert view.editor.page_count >= 3
+
+    view.jump_to_page(1)
+    qapp.processEvents()
+
+    assert view.current_page == 1
+    assert view.editor_canvas.verticalScrollBar().value() > 0
+    view.close()
+
+
+def test_mouse_wheel_scrolls_pages_and_ctrl_wheel_zooms(qapp) -> None:
+    document = _reflow_document()
+    document.sections[0].blocks = [Paragraph(runs=[TextRun("滚轮分页内容。" * 600)])]
+    view = DocumentEditorView()
+    view.resize(520, 360)
+    view.set_document(document)
+    view.show()
+    qapp.processEvents()
+    editor = view.editor
+    canvas_scroll = view.editor_canvas.verticalScrollBar()
+    assert canvas_scroll.maximum() > 0
+
+    scroll_event = QWheelEvent(
+        QPointF(80, 80),
+        QPointF(80, 80),
+        QPoint(),
+        QPoint(0, -120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    assert qapp.sendEvent(editor.viewport(), scroll_event)
+    assert canvas_scroll.value() > 0
+
+    before_zoom = editor.zoom_factor
+    zoom_event = QWheelEvent(
+        QPointF(80, 80),
+        QPointF(80, 80),
+        QPoint(),
+        QPoint(0, 120),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.ControlModifier,
+        Qt.ScrollPhase.ScrollUpdate,
+        False,
+    )
+    assert qapp.sendEvent(editor.viewport(), zoom_event)
+    assert editor.zoom_factor > before_zoom
     view.close()
